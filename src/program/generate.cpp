@@ -4054,6 +4054,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         heap_mark("everything before the session");
+        if (glm5_model)
+            std::fprintf(stderr, "strata generate: session state on CUDA0 (layers %lld-%lld): %.1f MiB\n", (long long) lo0,
+                         (long long) (hi0 < 0 ? g.n_layers - 1 : hi0 - 1),
+                         (double) strata::core::session_bytes(g, o.max_context, K, lo0, hi0) / 1048576.0);
         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
             std::fprintf(stderr, "strata generate: session_init failed\n");
             return 1;
@@ -4092,6 +4096,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         const bool last = i + 1 == stages.size();
+        if (glm5_model)
+            std::fprintf(stderr, "strata generate: session state on CUDA%d (layers %lld-%lld): %.1f MiB\n", st.dev,
+                         (long long) st.lb, (long long) (st.le - 1),
+                         (double) strata::core::session_bytes(g, o.max_context, K, st.lb, st.le) / 1048576.0);
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {

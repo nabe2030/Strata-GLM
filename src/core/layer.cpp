@@ -667,9 +667,19 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+namespace {
+/// step2b: glm5-next keeps its K/V in the verifier's own latent cache (verify_glm5.cpp), so the session's per-layer
+/// Qwen-layout K/V pools and indexer pools are never read: they are carved for a few cells only (the RoPE tables, and the
+/// `max_cells` the verifier reads, stay the context's).  STRATA_GLM5_SS_FULL=1: the whole-context pools as before.
+int64_t qsa_plan_cells(const ModelGeometry& g, int64_t max_cells) {
+    static const bool full = [] { const char* v = std::getenv("STRATA_GLM5_SS_FULL"); return v != nullptr && v[0] == '1'; }();
+    return g.is_glm5_next() && !full ? std::min<int64_t>(max_cells, 64) : max_cells;
+}
+}  // namespace
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const KvPlan p = kv_plan(s, qsa_plan_cells(g, max_cells), ring_cells);
     uint64_t n = 0;
     if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
@@ -689,7 +699,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const KvPlan p = kv_plan(s, qsa_plan_cells(g, max_cells), ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
     st.kv_int8 = g_kv_int8 && !g_kv_q4;
