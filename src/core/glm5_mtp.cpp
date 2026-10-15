@@ -28,6 +28,15 @@
 #include <fstream>
 #include <sstream>
 
+// Linux: _fseeki64 is Windows-only (local build patch)
+static inline int glm5_fseek64(std::FILE* f, long long off) {
+#if defined(_WIN32)
+    return _fseeki64(f, off, SEEK_SET);
+#else
+    return fseeko(f, (off_t) off, SEEK_SET);
+#endif
+}
+
 namespace strata::core {
 
 struct Glm5Mtp::Impl {
@@ -204,7 +213,7 @@ bool Glm5Mtp::init(const WeightTable& wt, const ModelGeometry& g, const NativeHe
         std::vector<uint8_t> buf;
         for (int r = 0; r < 3; ++r) {
             buf.resize((size_t) m.NE * role_bytes[r]);
-            if (_fseeki64(f, role_off[r], SEEK_SET) != 0 || std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
+            if (glm5_fseek64(f, role_off[r]) != 0 || std::fread(buf.data(), 1, buf.size(), f) != buf.size()) {
                 std::fclose(f);
                 err = "glm5 mtp: reading blk.45's experts from " + path + " failed";
                 return false;
