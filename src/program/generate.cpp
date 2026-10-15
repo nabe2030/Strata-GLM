@@ -2095,7 +2095,13 @@ int main(int argc, char** argv) {
         if (std::getenv("STRATA_MN_ADAPT") == nullptr) o.adapt_swaps = 0;
         if (stage_mode) {   // every expert of a stage is on its GPU: the CPU pool has nothing to do, so keep it small
             if (o.pool_workers <= 0) o.pool_workers = 1;   // and asleep (its spinning only heats the stage PC's CPU)
-            if (std::getenv("STRATA_POOL_SPIN_US") == nullptr) _putenv("STRATA_POOL_SPIN_US=0");
+            if (std::getenv("STRATA_POOL_SPIN_US") == nullptr) {
+#if defined(_WIN32)
+                _putenv("STRATA_POOL_SPIN_US=0");
+#else
+                setenv("STRATA_POOL_SPIN_US", "0", 1);
+#endif
+            }
         }
         std::fprintf(stderr, "strata serve: multinode %s: prompts read through the verify windows, no prompt cache, "
                              "no adaptive swaps\n", remote_head ? "head" : "stage");
@@ -12411,7 +12417,7 @@ int main(int argc, char** argv) {
             strata::core::Verifier::Glm5Fetch spf;
             spf.host_res = host_res.empty() ? nullptr : host_res.data();
             spf.cache_base = thits.cache_base;
-            spf.slot_off = xcache.slot_offsets();
+            spf.slot_off = reinterpret_cast<decltype(spf.slot_off)>(xcache.slot_offsets());
             spf.cache_blob = (uint64_t) thits.blob;
             spf.ctx = srcp;
             spf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
@@ -12562,7 +12568,7 @@ int main(int argc, char** argv) {
             strata::core::Verifier::Glm5Fetch pf;
             pf.host_res = host_res.empty() ? nullptr : host_res.data();
             pf.cache_base = thits.cache_base;
-            pf.slot_off = xcache.slot_offsets();
+            pf.slot_off = reinterpret_cast<decltype(pf.slot_off)>(xcache.slot_offsets());
             pf.cache_blob = (uint64_t) thits.blob;
             pf.ctx = srcp;
             pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
@@ -13569,7 +13575,7 @@ int main(int argc, char** argv) {
                 strata::core::Verifier::Glm5Fetch pf;
                 pf.host_res = host_res.empty() ? nullptr : host_res.data();
                 pf.cache_base = thits.cache_base;
-                pf.slot_off = xcache.slot_offsets();
+                pf.slot_off = reinterpret_cast<decltype(pf.slot_off)>(xcache.slot_offsets());
                 pf.cache_blob = (uint64_t) thits.blob;
                 pf.ctx = srcp;
                 pf.blob = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob(l, e); };
