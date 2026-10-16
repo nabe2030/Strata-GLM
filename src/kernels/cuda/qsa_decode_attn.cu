@@ -920,14 +920,24 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
     // the tensor-core chunk for the prompt path's sub-batches (>= 16 queries; the decode's windows, captured in graphs,
     // keep the CUDA-core kernel).  STRATA_MLA_TC=0: the CUDA-core kernel everywhere
     static const bool tc_on = [] { const char* v = std::getenv("STRATA_MLA_TC"); return !(v && v[0] == '0'); }();
-    static bool tc_ready = false;
-    if (tc_on && n_q >= 16 && !tc_ready) {
+    // per device (step2b): the shared-memory opt-in belongs to the device, and a layer split runs this on several
+    static bool tc_ready_dev[64] = {};
+    static bool tc_tried_dev[64] = {};
+    static int tc32_ready_dev[64];
+    static const bool tc32_init = [] { for (int& v : tc32_ready_dev) v = -1; return true; }();
+    (void) tc32_init;
+    int tdev = 0;
+    cudaGetDevice(&tdev);
+    if (tdev < 0 || tdev >= 64) tdev = 0;
+    bool& tc_ready = tc_ready_dev[tdev];
+    if (tc_on && n_q >= 16 && !tc_tried_dev[tdev]) {
+        tc_tried_dev[tdev] = true;
         tc_ready = cudaFuncSetAttribute(mla_chunk_tc_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTcSmem) == cudaSuccess;
         cudaGetLastError();
     }
     // the 32-head kernel where its shared memory fits (STRATA_MLA_TC32=0: the 16-head one)
     static const bool tc32_on = [] { const char* v = std::getenv("STRATA_MLA_TC32"); return !(v && v[0] == '0'); }();
-    static int tc32_ready = -1;
+    int& tc32_ready = tc32_ready_dev[tdev];
     if (tc32_ready < 0 && tc_on && n_q >= 16) {
         tc32_ready = tc32_on && n_head % MGH2 == 0 &&
                      cudaFuncSetAttribute(mla_chunk_tc32_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTc32Smem) == cudaSuccess;

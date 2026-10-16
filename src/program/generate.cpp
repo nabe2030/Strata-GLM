@@ -12649,6 +12649,22 @@ int main(int argc, char** argv) {
             };
             pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
             pf.prefetch = [](void* c, int64_t l, const int64_t* e, int64_t n) { ((strata::core::ExpertSource*) c)->prefetch_async(l, e, n); };
+            // test hook: teacher-forced continuation and the logits file (see the decode loop)
+            std::vector<int32_t> serve_follow_ids;
+            std::FILE* serve_logits = nullptr;
+            if (const char* fv = std::getenv("STRATA_SERVE_FOLLOW")) {
+                std::ifstream fin(fv);
+                std::string txt((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+                std::vector<int64_t> ids64;
+                std::string fe;
+                if (!fin || !parse_i64_list(txt.c_str(), ids64, fe)) {
+                    std::fprintf(stderr, "strata serve: cannot read STRATA_SERVE_FOLLOW %s\n", fv);
+                    return 2;
+                }
+                for (const int64_t v : ids64) serve_follow_ids.push_back((int32_t) v);
+                if (const char* lv = std::getenv("STRATA_SERVE_LOGITS")) serve_logits = std::fopen(lv, "wb");
+            }
+            const bool serve_follow = !serve_follow_ids.empty();
             // the later GPU's own expert cache for the chunk path (one process, two GPUs)
             strata::core::Verifier::Glm5Fetch pf_gs = pf;
             if (gl_gs != nullptr) {
@@ -13382,6 +13398,8 @@ int main(int argc, char** argv) {
                 // the prompt's cells [reused, n - 1)
                 bool cancelled = false;
                 bool poisoned = false;   // 2026-10-13: a window's head logits were non-finite (Verifier::nonfinite_row)
+                // the head is on the last stage: with a split its verifier, not the first's, sees the logits (step2b)
+                auto nf_row = [&]() { return gl_chain.empty() ? ver.nonfinite_row : gl_last->nonfinite_row; };
                 // STRATA_GLM5_PF_MIN (2026-10-10): the fewest new cells the chunk path takes (16); fewer go as verify windows
                 static const int64_t pf_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_MIN"); return v ? std::atoll(v) : 16; }();
                 // STRATA_GLM5_PF_SEED_ROUNDS (2026-10-10, opt-in): after a prompt of >= 256 new cells, its routing counts go
@@ -13441,10 +13459,10 @@ int main(int argc, char** argv) {
                             std::fflush(stdout);
                             return 1;
                         }
-                        if (ver.nonfinite_row >= 0 && !poisoned) {
+                        if (nf_row() >= 0 && !poisoned) {
                             poisoned = true;
                             std::fprintf(stderr, "strata serve: non-finite logits reading the prompt at position %lld "
-                                                 "(row %d)\n", (long long) q, ver.nonfinite_row);
+                                                 "(row %d)\n", (long long) q, nf_row());
                         }
                         q += T;
                         cancelled = stop_req.load();
@@ -13507,6 +13525,7 @@ int main(int argc, char** argv) {
                         const int k = sd.propose(o.spec - 1, sb.data());
                         if (k > 0) { T = std::min<int>(k + 1, o.spec); for (int i = 1; i < T; ++i) win[(size_t) i] = sb[(size_t) i - 1]; }
                     }
+                    if (serve_follow && produced_n < (int64_t) serve_follow_ids.size()) T = 1;   // teacher forcing: one position a window
                     if (pos + T > o.max_context) { finish = "length"; break; }
                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
                     if (gjob) {
@@ -13522,10 +13541,10 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
-                    if (ver.nonfinite_row >= 0) {   // none of this window's tokens go out; the state is dropped below
+                    if (nf_row() >= 0) {   // none of this window's tokens go out; the state is dropped below
                         std::fprintf(stderr, "strata serve: non-finite logits at position %lld (row %d): the reply ends "
                                              "here and the next request reads its prompt from the start\n",
-                                     (long long) pos, ver.nonfinite_row);
+                                     (long long) pos, nf_row());
                         poisoned = true;
                         finish = "nonfinite";
                         break;
@@ -13534,6 +13553,17 @@ int main(int argc, char** argv) {
                         std::printf("ERR an adaptive refill failed\n");
                         std::fflush(stdout);
                         return 1;
+                    }
+                    // STRATA_SERVE_FOLLOW=ids.txt + STRATA_SERVE_LOGITS=out.bin (a test hook, 2026-10): the model's pick is replaced by
+                    // the given continuation and each position's logits (F32, one vocab row) are appended - two runs over the
+                    // same continuation compare position by position (KL, top-1), as --spec-follow does in the one-shot loop
+                    if (serve_follow && T == 1 && produced_n < (int64_t) serve_follow_ids.size()) {
+                        if (serve_logits != nullptr) {
+                            std::vector<float> row((size_t) ver.vocab());
+                            if (ver.copy_logits(0, row.data())) std::fwrite(row.data(), sizeof(float), row.size(), serve_logits);
+                            std::fflush(serve_logits);
+                        }
+                        outw[0] = serve_follow_ids[(size_t) produced_n];
                     }
                     int a = 0;
                     while (a < T - 1 && win[(size_t) a + 1] == outw[(size_t) a]) ++a;

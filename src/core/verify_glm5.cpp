@@ -974,7 +974,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     // GEMM a slice instead of 2 x n_head native_mmvq launches (half of the prompt path's ~1.8M launches a 4K chunk).
     // The layer's two Q8_0 tensors are dequantized once per chunk into F32 scratch.  STRATA_GLM5_PF_BLAS=0: as before.
     static const bool pf_blas_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_BLAS"); return !(v && v[0] == '0'); }();
-    static cublasHandle_t pf_blas = nullptr;
+    // one cuBLAS handle PER DEVICE (step2b): a handle made on CUDA0 is bound to CUDA0's context, and the later GPU of a
+    // two-GPU split runs this same function ("illegal memory access" at its first layer)
+    static cublasHandle_t pf_blas_dev[64] = {};
+    cublasHandle_t& pf_blas = pf_blas_dev[(device_ >= 0 && device_ < 64) ? device_ : 0];
     float* kb_f = nullptr;   // [NH][KVR][QK]
     float* vb_f = nullptr;   // [NH][VD][KVR]
     int64_t kbvb_layer = -1;
@@ -1496,7 +1499,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         quantize_q8_1_rows(xmc, T, N, q8c, cs);
         cudaMemcpyAsync(h_ids.data(), idsc, (size_t) TK * 4, cudaMemcpyDeviceToHost, cs);
         const auto tm0 = std::chrono::steady_clock::now();
-        if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
+        if (const cudaError_t se_r = cudaStreamSynchronize(cs); se_r != cudaSuccess) { err = std::string("verify glm5 prefill: the router failed on the GPU (CUDA") + std::to_string(device_) + ", layer " + std::to_string(l) + ": " + cudaGetErrorString(se_r) + ")"; return false; }
         const bool ahead_here = ahead_layer == l;
         if (ahead_here) cudaStreamWaitEvent(cs, ev_ahead_done, 0);   // the look-ahead slots have landed
         auto ahead_of = [&](int32_t e) { return ahead_here ? ahead_slot[(size_t) e] : -1; };
@@ -2203,7 +2206,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
     double w_plan_ms = 0, w_enq_ms = 0;   // STRATA_GLM5_PF_PROF: the walk's host-side parts
     auto moe_walk = [&](int64_t l, int64_t Pn) -> bool {
         touch_next(l + 1, Pn);
-        if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
+        if (const cudaError_t se_r = cudaStreamSynchronize(cs); se_r != cudaSuccess) { err = std::string("verify glm5 prefill: the router failed on the GPU (CUDA") + std::to_string(device_) + ", layer " + std::to_string(l) + ": " + cudaGetErrorString(se_r) + ")"; return false; }
         float* acc = Rc;
         float* xa = parts;                                       // the group's FFN inputs
         uint8_t* q8a = (uint8_t*) (parts + (size_t) PG * N);     // their q8_1 image (native layers)
