@@ -444,6 +444,7 @@ private:
     bool init_glm5(std::string& err);
     bool record_window_glm5(int T, cudaStream_t cs, std::string& err);
     bool capture_commit_glm5(std::string& err);
+    void glm5_ldump_window(int T, int64_t pos0);   // step2c (investigation): STRATA_GLM5_LDUMP
     void free_glm5();
     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
     // per layer and token group, written to mapped memory (null when the trace is off)

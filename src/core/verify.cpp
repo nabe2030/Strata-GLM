@@ -2163,6 +2163,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
     }
+    if (glm_ != nullptr) glm5_ldump_window(T, pos0);
     VDBG("window done\n");
     ++windows;
     progress_at("decode");
