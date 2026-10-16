@@ -12673,7 +12673,28 @@ int main(int argc, char** argv) {
             }
             // multinode (2026-10-08): each chunk through [0, K1) here, the stage engines' ranges, then [Kn, end) here
             std::vector<std::vector<float>> mn_hand;
+            float* gl_pf_hand = nullptr;   // one process, two GPUs: the hand-off rows of one walk group (page-locked, made once)
             auto mn_prefill = [&](const int32_t* toks, int64_t n_tok, int64_t p0, std::string& e) -> bool {
+                if (gl_gs != nullptr) {
+                    // one call per group of up to pf_chunk * hc tokens: each range then runs the layer walk over the group
+                    // (its experts streamed once for the group, not once per chunk), the first range's last state going to
+                    // the later one through the hand-off rows
+                    const int64_t seg = (int64_t) pf_chunk * g.hc, HFl = strata::core::Verifier::handoff_floats(g);
+                    if (gl_pf_hand == nullptr &&
+                        cudaHostAlloc((void**) &gl_pf_hand, (size_t) seg * (size_t) HFl * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+                        cudaGetLastError();
+                        e = "the prompt path's hand-off rows could not be page-locked";
+                        return false;
+                    }
+                    for (int64_t c0 = 0; c0 < n_tok; c0 += seg) {
+                        const int64_t T = std::min<int64_t>(seg, n_tok - c0);
+                        if (!ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, 0, split_at.front(), nullptr, gl_pf_hand) ||
+                            !gl_gs->ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf_gs, e, split_at.front(), -1, gl_pf_hand,
+                                                     nullptr))
+                            return false;
+                    }
+                    return true;
+                }
                 const size_t nr = gl_links.size();
                 const size_t rows = (size_t) pf_chunk * (size_t) strata::core::Verifier::handoff_floats(g);
                 mn_hand.resize(nr + 1);
@@ -12683,12 +12704,6 @@ int main(int argc, char** argv) {
                     if (!ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, 0, split_at.front(), nullptr,
                                           mn_hand[0].data()))
                         return false;
-                    if (gl_gs != nullptr) {   // one process, two GPUs: the later GPU's range takes the chunk from the hand-off
-                        if (!gl_gs->ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf_gs, e, split_at.front(), -1,
-                                                     mn_hand[0].data(), nullptr))
-                            return false;
-                        continue;
-                    }
                     for (size_t r = 0; r < nr; ++r)
                         if (!gl_links[r]->prefill((int) T, p0 + c0, toks + c0, mn_hand[r].data(), mn_hand[r + 1].data(), e))
                             return false;

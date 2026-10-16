@@ -1955,7 +1955,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
 
     // a layer split: this call runs [lb, le) of one chunk; the hand-off rows are R | the last FFN's output | post | comb
     const int64_t lb = l_begin, le = l_end < 0 ? g.n_layers : l_end, HF = handoff_floats(g);
-    if (lb < 0 || le > g.n_layers || lb >= le || ((lb > 0 || le < g.n_layers) && n_all > C) ||
+    // (step2b: a range may take several chunks when the layer walk runs it - one group of up to C * HC tokens per call,
+    // the hand-off rows of all n_all tokens in the caller's buffers; checked again below once the walk's buffers are in)
+    static const bool pf_walk_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_WALK"); return !(v && v[0] == '0'); }();
+    if (lb < 0 || le > g.n_layers || lb >= le || ((lb > 0 || le < g.n_layers) && n_all > C && !pf_walk_on) ||
         (lb > 0 && hand_in == nullptr) || (le < g.n_layers && hand_out == nullptr)) {
         err = "verify glm5 prefill: a layer range runs one chunk, with its hand-offs";
         return false;
@@ -2148,7 +2151,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         void* p[5];
         ~HostFree() { for (void* q : p) if (q) cudaFreeHost(q); }
     } host_free{{nullptr, nullptr, nullptr, nullptr, nullptr}};
-    bool walk = pf_walk && lb == 0 && le == g.n_layers && n_all > C;
+    bool walk = pf_walk && n_all > C;
     if (walk) {
         auto halloc = [&](size_t bytes, int i) -> void* {
             void* p = nullptr;
@@ -2172,6 +2175,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             if (hostS && hq8 && hids && hw && pcsr && E_cap >= std::min<int64_t>(PG, C)) { walk = true; break; }
             hfree();
             if (PG <= 2 * C) break;
+        }
+        if (!walk && (lb > 0 || le < g.n_layers)) {
+            err = "verify glm5 prefill: a layer range runs one chunk, with its hand-offs (the layer walk has no page-locked memory)";
+            return false;
         }
         if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr)
             std::fprintf(stderr, "strata glm5 prefill: layer walk %s (groups of %lld tokens, %lld expert rows a launch, %zu MiB "
@@ -2505,9 +2512,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         const int64_t T = std::min<int64_t>(C, g0 + Pn - c0);
                         float* hs = hostS + (size_t) (c0 - g0) * HF;
                         auto tp = std::chrono::steady_clock::now();
-                        if (!chunk_begin(c0, T, l == lb)) return false;
+                        if (!chunk_begin(c0, T, l == lb && lb == 0)) return false;
                         (void) hs;
                         if (l > lb) walk_parts(c0 - g0, T, true);
+                        else if (lb > 0) hand_parts(hand_in + (size_t) c0 * HF, nullptr, T);   // a later range: the previous range's state
                         double f0 = ms_ffn;
                         lap(ms_ffn, tp);
                         w_ms[0] += ms_ffn - f0;   // the state in (and the steps, the embedding)
@@ -2541,8 +2549,22 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
                         w_ms[3] += ms_ffn - f0;   // the routed experts
                     }
                 }
+                if (le < g.n_layers) {   // an earlier range: the group's final state, from the walk's arrays into the hand-off rows
+                    if (const cudaError_t se_w = cudaStreamSynchronize(cs); se_w != cudaSuccess) {
+                        err = std::string("verify glm5 prefill: ") + cudaGetErrorString(se_w);
+                        return false;
+                    }
+                    const float *hR = hostS, *hB = hR + (size_t) PG * HC * N, *hP = hB + (size_t) PG * N, *hC = hP + (size_t) PG * HC;
+                    for (int64_t t = 0; t < Pn; ++t) {
+                        float* row = hand_out + (size_t) (g0 + t) * HF;
+                        std::memcpy(row, hR + (size_t) t * HC * N, (size_t) HC * N * 4);
+                        std::memcpy(row + HC * N, hB + (size_t) t * N, (size_t) N * 4);
+                        std::memcpy(row + HC * N + N, hP + (size_t) t * HC, (size_t) HC * 4);
+                        std::memcpy(row + HC * N + N + HC, hC + (size_t) t * HC * HC, (size_t) HC * HC * 4);
+                    }
+                }
             }
-            walk_parts(last_c0 - last_g0, last_T, true);   // the caller reads the last chunk
+            if (le == g.n_layers) walk_parts(last_c0 - last_g0, last_T, true);   // the caller reads the last chunk
         } else {
             for (int64_t c0 = 0; c0 < n_all; c0 += C) {
                 const int64_t T = std::min<int64_t>(C, n_all - c0);
