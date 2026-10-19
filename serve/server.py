@@ -3159,6 +3159,15 @@ class Service:
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
     def render_prompt(self, messages, tools, kwargs) -> str:
+        """The template rendered, and for a request without thinking closed the way the model expects: a template with
+        no switch for it (GLM's: the generation prompt always ends in `<think>`) leaves the model to think into the
+        reply, so the thinking block is closed - the empty one a history turn is drawn with."""
+        text = self._render_prompt(messages, tools, kwargs)
+        if kwargs.get("enable_thinking") is False and text.endswith("<think>"):
+            text += "</think>"
+        return text
+
+    def _render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
