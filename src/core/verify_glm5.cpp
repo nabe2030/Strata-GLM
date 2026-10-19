@@ -701,35 +701,53 @@ static StateSpans glm5_spans(const ModelGeometry& g, SessionState& ss, float* ta
 }
 
 bool Verifier::glm5_state_save(std::vector<float>& host, std::string& err) {
+    host.clear();
+    return glm5_state_append(host, err);
+}
+
+// a layer split on one PC (2026-10-20): the state of every stage, in chain order - this verifier's span first, then
+// the next's (each on its own device and stream).  A stage in another engine cannot be read back.
+bool Verifier::glm5_state_append(std::vector<float>& host, std::string& err) {
+    if (remote_ != nullptr) { err = "glm5 state: a stage in another engine cannot be saved"; return false; }
     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
     const OnDevice on_device(device_);
     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
-    host.resize(s.gdn_n + s.tail_n);
+    const size_t off = host.size();
+    host.resize(off + s.gdn_n + s.tail_n);
     cudaStreamSynchronize(cs_);
-    if (cudaMemcpy(host.data(), s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(host.data() + s.gdn_n, s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+    if (cudaMemcpy(host.data() + off, s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(host.data() + off + s.gdn_n, s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
         err = "glm5 state: save failed";
         return false;
     }
-    return true;
+    return next_ == nullptr || next_->glm5_state_append(host, err);
 }
 
 bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& err) {
+    size_t off = 0;
+    if (!glm5_state_restore_at(host, off, err)) return false;
+    if (off != host.size()) { err = "glm5 state: a snapshot of another size"; return false; }
+    return true;
+}
+
+bool Verifier::glm5_state_restore_at(const std::vector<float>& host, size_t& off, std::string& err) {
+    if (remote_ != nullptr) { err = "glm5 state: a stage in another engine cannot be restored"; return false; }
     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
     const OnDevice on_device(device_);
     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
-    if (host.size() != s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
+    if (host.size() < off + s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
     // 2026-10-13: on cs_ and waited for.  A cudaMemcpy from pageable memory may return before its DMA lands, and cs_
     // (non-blocking) does not wait for the legacy stream - the next prompt could read the previous conversation's
     // state (Project Maya 4f1f4d7 saw a reply to another conversation's question)
     cudaStreamSynchronize(cs_);
-    if (cudaMemcpyAsync(s.gdn, host.data(), s.gdn_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
-        cudaMemcpyAsync(s.tail, host.data() + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+    if (cudaMemcpyAsync(s.gdn, host.data() + off, s.gdn_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+        cudaMemcpyAsync(s.tail, host.data() + off + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
         cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = "glm5 state: restore failed";
         return false;
     }
-    return true;
+    off += s.gdn_n + s.tail_n;
+    return next_ == nullptr || next_->glm5_state_restore_at(host, off, err);
 }
 
 bool Verifier::glm5_state_zero(std::string& err) {

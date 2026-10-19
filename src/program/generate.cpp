@@ -13447,6 +13447,7 @@ int main(int argc, char** argv) {
                             if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
                             err.clear();
                             live.clear();   // the state holds part of this prompt now: the next request does not go on from it
+                            snap_toks.clear();   // and its cells may overlie the snapshot's
                             continue;
                         }
                         if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
@@ -13460,6 +13461,7 @@ int main(int argc, char** argv) {
                         if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
                         err.clear();
                         live.clear();   // as above
+                        snap_toks.clear();
                         continue;
                     }
                 } else {
@@ -13508,8 +13510,12 @@ int main(int argc, char** argv) {
                 }
                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
                 live.assign(prompt.begin(), prompt.begin() + np);
-                // multinode: no snapshot (a stage engine's state cannot be read back) - the live sequence only
-                if (gl_chain.empty()) {
+                // multinode: no snapshot (a stage engine's state cannot be read back) - the live sequence only.  The local
+                // two-GPU split (gl_gs) has every stage in this process: its snapshot is the chain's states in order
+                if (cancelled) {   // the window path stopped part-way: the cells and the state are not the whole prompt's
+                    live.clear();
+                    snap_toks.clear();
+                } else if (gl_chain.empty() || gl_gs != nullptr) {
                     if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
                     snap_toks = live;
                     // slots: the whole prompt, when it is long enough to be worth a file and was not just read from one

@@ -299,6 +299,9 @@ public:
     /// cells are never rewritten) - copied to `host`, back from it, or zeroed (a new sequence).
     bool glm5_state_save(std::vector<float>& host, std::string& err);
     bool glm5_state_restore(const std::vector<float>& host, std::string& err);
+    /// the chain's walk (a local layer split): this stage's span is appended to / read from `host` at `off`, then the next's
+    bool glm5_state_append(std::vector<float>& host, std::string& err);
+    bool glm5_state_restore_at(const std::vector<float>& host, size_t& off, std::string& err);
     bool glm5_state_zero(std::string& err);
     /// A sequence SLOT on disk (2026-10-09): the state above plus the latents and the indexer blocks of cells
     /// [0, n_cells) - everything a later request whose prompt starts with `toks` needs to go on without reading them
