@@ -1011,7 +1011,15 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
         }
     }
     if (pf_blas_on) {
-        if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
+        // The handle is made anew for every call and bound to THIS call's compute stream at once.  Before, it was bound
+        // (and given a workspace) only when the three scratch carves below all succeeded.  For a small chunk (`parts` under
+        // ~75 MiB, chunk <= ~512) they fail, yet the handle stayed non-null: the router's cublasSgemm then ran on the legacy
+        // default stream, which does not synchronise with the non-blocking `cs`, and its logits were read before / while
+        // being written.  A static handle kept from an earlier call would also still point at that call's freed `parts`
+        // as its workspace; a fresh handle has cuBLAS's own workspace and no stale stream.
+        if (pf_blas != nullptr) { cublasDestroy(pf_blas); pf_blas = nullptr; }
+        if (cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
+        else cublasSetStream(pf_blas, cs);
         if (pf_blas != nullptr) {
             float* p = parts;
             float* const end = parts_end;
@@ -1021,8 +1029,13 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0, 
             vb_f = take((size_t) m.NH * m.VD * m.KVR);
             if (ws == nullptr || kb_f == nullptr || vb_f == nullptr) {
                 kb_f = vb_f = nullptr;   // a small chunk: the per-head launches
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::fprintf(stderr, "strata glm5 prefill: the chunk (%lld tokens) is too small for the batched cuBLAS scratch "
+                                 "(~75 MiB of `parts`): MLA absorb per head, KDA / MLA / shared-expert batching off\n", (long long) C);
+                }
             } else {
-                cublasSetStream(pf_blas, cs);
                 cublasSetWorkspace(pf_blas, ws, kBlasWs);
                 if (pf_kda_on) {
                     const size_t di = (size_t) KSB * m.DI;
