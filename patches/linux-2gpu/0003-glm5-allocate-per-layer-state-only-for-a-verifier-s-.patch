@@ -1,0 +1,212 @@
+From 694c5e00a87f7f604e9857e15b47888d836ba2e5 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 08:37:50 +0900
+Subject: [PATCH 03/10] glm5: allocate per-layer state only for a verifier's
+ own layers
+
+Original summary: glm5: per-layer state only for a verifier's own layers (latent/indexer pools/tails), session K/V pools not carved for glm5 (never read); VRAM report lines
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/core/layer.cpp       | 14 +++++++++++--
+ src/core/verify_glm5.cpp | 45 ++++++++++++++++++++++++++++++----------
+ src/program/generate.cpp |  8 +++++++
+ 3 files changed, 54 insertions(+), 13 deletions(-)
+
+diff --git a/src/core/layer.cpp b/src/core/layer.cpp
+index 3132871..16f2ec0 100644
+--- a/src/core/layer.cpp
++++ b/src/core/layer.cpp
+@@ -667,9 +667,19 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
+ int64_t qsa_kv_resident_min() { return 20480; }
+ uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+ 
++namespace {
++/// step2b: glm5-next keeps its K/V in the verifier's own latent cache (verify_glm5.cpp), so the session's per-layer
++/// Qwen-layout K/V pools and indexer pools are never read: they are carved for a few cells only (the RoPE tables, and the
++/// `max_cells` the verifier reads, stay the context's).  STRATA_GLM5_SS_FULL=1: the whole-context pools as before.
++int64_t qsa_plan_cells(const ModelGeometry& g, int64_t max_cells) {
++    static const bool full = [] { const char* v = std::getenv("STRATA_GLM5_SS_FULL"); return v != nullptr && v[0] == '1'; }();
++    return g.is_glm5_next() && !full ? std::min<int64_t>(max_cells, 64) : max_cells;
++}
++}  // namespace
++
+ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+     const QsaShapes s = qsa_shapes(g);
+-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
++    const KvPlan p = kv_plan(s, qsa_plan_cells(g, max_cells), ring_cells);
+     uint64_t n = 0;
+     if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
+@@ -689,7 +699,7 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
+ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                         const QsaState* share_rope, int64_t ring_cells) {
+     const QsaShapes s = qsa_shapes(g);
+-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
++    const KvPlan p = kv_plan(s, qsa_plan_cells(g, max_cells), ring_cells);
+     const int64_t pages = p.pages;
+     Cursor c{(uint8_t*) base};
+     st.kv_int8 = g_kv_int8 && !g_kv_q4;
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index cb6c8f0..6f29194 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -75,6 +75,10 @@ struct Verifier::Glm5 {
+     float rms_eps = 1e-5f, ln_eps = 1e-6f, hc_eps = 1e-6f, lb = -5.f, wscale = 1.f, clamp_exp = 0.f, clamp_sh = 0.f;
+     int iters = 20, n_slices = 0;
+     std::vector<int64_t> kda_index, dsa_index;            // per layer: its ordinal among its kind, or -1
++    // step2b: the per-DSA-layer buffers below (latent, tail, pooled, raw_k/g) hold only THIS verifier's layers [lb, le):
++    // `d0` is the global ordinal of its first DSA layer, `nD_own` their count (a whole-model verifier: 0 and all of them)
++    int64_t d0 = 0, nD_own = 0;
++    int64_t local_dsa(int64_t l) const { return dsa_index[(size_t) l] < 0 ? -1 : dsa_index[(size_t) l] - d0; }
+     // per KDA layer
+     float* convw = nullptr;          // [nK][C][4]
+     float* gate = nullptr;           // [nK][MT][H][S]
+@@ -156,6 +160,19 @@ bool Verifier::init_glm5(std::string& err) {
+     int64_t nK = 0, nD = 0;
+     for (int64_t l = 0; l < g.n_layers; ++l) (g.is_sparse_layer(l) ? m.dsa_index : m.kda_index)[(size_t) l] = g.is_sparse_layer(l) ? nD++ : nK++;
+     if (nK != g.n_gdn_layers() || nD != g.n_qsa_layers()) { err = "verify glm5: layer kinds disagree with the geometry"; return false; }
++    // step2b: the latent cache, the indexer tails and pools are allocated for this verifier's own DSA layers only
++    // (STRATA_GLM5_KV_ALL=1: for every DSA layer, as before)
++    m.d0 = 0; m.nD_own = nD;
++    {
++        static const bool all = [] { const char* v = std::getenv("STRATA_GLM5_KV_ALL"); return v && v[0] == '1'; }();
++        if (!all) {
++            int64_t first = -1, cnt = 0;
++            for (int64_t l = lb_; l < le_; ++l)
++                if (m.dsa_index[(size_t) l] >= 0) { if (first < 0) first = m.dsa_index[(size_t) l]; ++cnt; }
++            if (first >= 0) { m.d0 = first; m.nD_own = cnt; } else { m.d0 = 0; m.nD_own = 0; }
++        }
++    }
++    nD = m.nD_own;
+     // per-layer device state
+     m.convw = m.dev<float>((size_t) nK * m.C * 4);
+     m.gate = m.dev<float>((size_t) nK * MT * m.H * m.S);
+@@ -228,9 +245,15 @@ bool Verifier::init_glm5(std::string& err) {
+                  (long long) m.QLR, (long long) m.KVR, (long long) m.QK, (long long) m.VD, (long long) m.IH, (long long) m.ID,
+                  (long long) m.NFF, (long long) m.NFFD, (long long) m.NE, (long long) m.K, (long long) m.cap, m.rms_eps,
+                  m.ln_eps, m.hc_eps, m.lb, m.wscale, m.clamp_exp, m.clamp_sh);
+-    std::fprintf(stderr, "strata verify: glm5-next window: %lld KDA + %lld DSA layers, %lld dense, %lld-cell latent cache "
+-                         "(%.1f MiB, %s)\n", (long long) nK, (long long) nD, (long long) g.n_dense_layers,
++    std::fprintf(stderr, "strata verify: glm5-next window (layers %lld-%lld): %lld KDA + %lld DSA layers (%lld DSA here), %lld dense, %lld-cell latent cache "
++                         "(%.1f MiB, %s)\n", (long long) lb_, (long long) (le_ - 1), (long long) nK, (long long) g.n_qsa_layers(), (long long) nD, (long long) g.n_dense_layers,
+                  (long long) m.max_cells, (double) nD * m.max_cells * m.lat_row / 1048576.0, m.lat_q4 ? "q4_0" : "fp16");
++    std::fprintf(stderr, "strata verify: glm5 per-layer state on CUDA%d (layers %lld-%lld): latent %.1f MiB + indexer pool %.1f MiB "
++                         "+ tails/keys %.2f MiB for %lld DSA layers (%lld cells)\n", device_, (long long) lb_, (long long) (le_ - 1),
++                 (double) nD * m.max_cells * m.lat_row / 1048576.0,
++                 (double) nD * (m.max_cells / 4 + 1) * m.ID * 2 / 1048576.0,
++                 ((double) nD * 3 * 2 * m.ID * 4 * 2 + (double) nD * MT * m.ID * 4 * 2) / 1048576.0, (long long) nD,
++                 (long long) m.max_cells);
+     return true;
+ }
+ 
+@@ -292,7 +315,7 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
+     auto pre = [&](int64_t l) -> bool {
+         float* xm = mixed_;   // the block input of the attention, then of the FFN
+         if (!mhc_read(l, "attn", l > 0, m.postF, m.combF, m.postA, m.combA, "attn_norm.weight", xm)) return false;
+-        const int64_t gi = m.kda_index[(size_t) l], qi = m.dsa_index[(size_t) l];
++        const int64_t gi = m.kda_index[(size_t) l], qi = m.local_dsa(l);
+         if (gi >= 0) {
+             // ======================= KDA =======================
+             const WeightRef *wq = wfind(wt, l, "attn_q.weight", err), *wk = wfind(wt, l, "attn_k.weight", err),
+@@ -525,7 +548,7 @@ bool Verifier::capture_commit_glm5(std::string& err) {
+     try {
+         copy_i32_from_mapped(commit_, m_commit_, 2 + MT, cs_);
+         for (int64_t l = lb_; l < le_ && ok; ++l) {   // this stage's layers
+-            const int64_t gi = m.kda_index[(size_t) l], qi = m.dsa_index[(size_t) l];
++            const int64_t gi = m.kda_index[(size_t) l], qi = m.local_dsa(l);
+             if (gi >= 0) {
+                 const WeightRef* wnm = wfind(*wt_, l, "ssm_norm.weight", err);
+                 if (!wnm) { ok = false; break; }
+@@ -591,7 +614,7 @@ static StateSpans glm5_spans(const ModelGeometry& g, SessionState& ss, float* ta
+ bool Verifier::glm5_state_save(std::vector<float>& host, std::string& err) {
+     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+     const OnDevice on_device(device_);
+-    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
++    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
+     host.resize(s.gdn_n + s.tail_n);
+     cudaStreamSynchronize(cs_);
+     if (cudaMemcpy(host.data(), s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+@@ -605,7 +628,7 @@ bool Verifier::glm5_state_save(std::vector<float>& host, std::string& err) {
+ bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& err) {
+     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+     const OnDevice on_device(device_);
+-    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
++    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
+     if (host.size() != s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
+     // 2026-10-13: on cs_ and waited for.  A cudaMemcpy from pageable memory may return before its DMA lands, and cs_
+     // (non-blocking) does not wait for the legacy stream - the next prompt could read the previous conversation's
+@@ -625,7 +648,7 @@ bool Verifier::glm5_state_zero(std::string& err) {
+     if (remote_ != nullptr) return remote_->reset(err) && (next_ == nullptr || next_->glm5_state_zero(err));
+     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+     const OnDevice on_device(device_);
+-    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, g_->n_qsa_layers(), glm_->ID);
++    const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
+     cudaStreamSynchronize(cs_);
+     // on cs_ and waited for (2026-10-13): a cudaMemset on the legacy stream can still be running when cs_ starts the
+     // next prompt, which then reads the previous conversation's state
+@@ -731,7 +754,7 @@ private:
+ 
+ bool Verifier::glm5_slot_write(const std::string& path, const int32_t* toks, int64_t n_cells, uint64_t fingerprint,
+                                std::string& err) {
+-    if (glm_ == nullptr || remote_ != nullptr) { err = "glm5 slot: no local glm5 window"; return false; }
++    if (glm_ == nullptr || remote_ != nullptr || glm_->nD_own != g_->n_qsa_layers()) { err = "glm5 slot: no local whole-model glm5 window"; return false; }
+     const Glm5& m = *glm_;
+     if (n_cells < 1 || n_cells > m.max_cells) { err = "glm5 slot: cells out of range"; return false; }
+     const OnDevice on_device(device_);
+@@ -788,7 +811,7 @@ bool Verifier::glm5_slot_peek(const std::string& path, uint64_t fingerprint, std
+ 
+ bool Verifier::glm5_slot_read(const std::string& path, uint64_t fingerprint, std::vector<int32_t>& toks,
+                               std::string& err) {
+-    if (glm_ == nullptr || remote_ != nullptr) { err = "glm5 slot: no local glm5 window"; return false; }
++    if (glm_ == nullptr || remote_ != nullptr || glm_->nD_own != g_->n_qsa_layers()) { err = "glm5 slot: no local whole-model glm5 window"; return false; }
+     const Glm5& m = *glm_;
+     const OnDevice on_device(device_);
+     const int64_t nD = g_->n_qsa_layers();
+@@ -1177,7 +1200,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         float* xm = xmc + (size_t) s0 * N;
+         float* bo = boc + (size_t) s0 * N;
+         int32_t* st = stepc + (size_t) s0 * kStepCount;
+-        const int64_t gi = m.kda_index[(size_t) l], qi = m.dsa_index[(size_t) l];
++        const int64_t gi = m.kda_index[(size_t) l], qi = m.local_dsa(l);
+         if (gi >= 0) {
+             const WeightRef *wq = wfind(wt, l, "attn_q.weight", err), *wk = wfind(wt, l, "attn_k.weight", err),
+                             *wv = wfind(wt, l, "attn_v.weight", err), *wo = wfind(wt, l, "attn_output.weight", err),
+@@ -1960,7 +1983,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         if (!wqa || !wqan || !wqb || !wkb || !wvb || !wkv || !wkvn || !wo || !wik || !wiqb || !wikn || !wikb || !wip ||
+             !wape || !wig) return false;
+         if (wkb->native_type != 8 || wvb->native_type != 8) { err = "verify glm5 prefill: attn_k_b / attn_v_b are not Q8_0"; return false; }
+-        const int64_t qi = m.dsa_index[(size_t) l];
++        const int64_t qi = m.local_dsa(l);
+         const int64_t QLR = m.QLR, NH = m.NH, QK = m.QK, KVR = m.KVR, VD = m.VD, ID = m.ID, IH = m.IH;
+         uint8_t* lat_pool = m.latent + (size_t) qi * m.max_cells * m.lat_row;
+         float* tail = m.tail + (size_t) qi * 3 * 2 * ID;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index fe85fa8..2bb2cc9 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -4054,6 +4054,10 @@ int main(int argc, char** argv) {
+             return 1;
+         }
+         heap_mark("everything before the session");
++        if (glm5_model)
++            std::fprintf(stderr, "strata generate: session state on CUDA0 (layers %lld-%lld): %.1f MiB\n", (long long) lo0,
++                         (long long) (hi0 < 0 ? g.n_layers - 1 : hi0 - 1),
++                         (double) strata::core::session_bytes(g, o.max_context, K, lo0, hi0) / 1048576.0);
+         if (strata::core::session_init(g, o.max_context, K, sbuf, ss, lo0, hi0) == 0) {
+             std::fprintf(stderr, "strata generate: session_init failed\n");
+             return 1;
+@@ -4092,6 +4096,10 @@ int main(int argc, char** argv) {
+             return 1;
+         }
+         const bool last = i + 1 == stages.size();
++        if (glm5_model)
++            std::fprintf(stderr, "strata generate: session state on CUDA%d (layers %lld-%lld): %.1f MiB\n", st.dev,
++                         (long long) st.lb, (long long) (st.le - 1),
++                         (double) strata::core::session_bytes(g, o.max_context, K, st.lb, st.le) / 1048576.0);
+         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
+         if (wo_s == nullptr ||
+             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
+-- 
+2.34.1
+

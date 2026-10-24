@@ -1,0 +1,328 @@
+From ec535ae9657580619a4009c9d11f00e0eb4f4922 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:48:29 +0900
+Subject: [PATCH 06/10] glm5: investigation hooks for the two-GPU path
+ (env-gated, off by default)
+
+Original summary: step2c investigation hooks (env-gated, off by default): per-layer hand-off dump, layer-3 FFN breakdown, router check, cuBLAS stream/workspace knobs, exit after prompt path
+
+STRATA_GLM5_LDUMP/_POS/_LAYER, STRATA_GLM5_PF_ROUTER_CHECK, STRATA_GLM5_PF_BLAS_STREAM,
+STRATA_GLM5_PF_WS_SEP, STRATA_GLM5_PF_EXIT.  No behaviour change without them.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp |   1 +
+ src/core/verify.cpp            |   1 +
+ src/core/verify_glm5.cpp       | 180 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 181 insertions(+), 1 deletion(-)
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index d269553..a43c6c0 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -444,6 +444,7 @@ private:
+     bool init_glm5(std::string& err);
+     bool record_window_glm5(int T, cudaStream_t cs, std::string& err);
+     bool capture_commit_glm5(std::string& err);
++    void glm5_ldump_window(int T, int64_t pos0);   // step2c (investigation): STRATA_GLM5_LDUMP
+     void free_glm5();
+     // #649: STRATA_VERIFY_TRACE=1 - a host event ring (trace_ev) and GPU breadcrumbs: the profiler's stamp points,
+     // per layer and token group, written to mapped memory (null when the trace is off)
+diff --git a/src/core/verify.cpp b/src/core/verify.cpp
+index 50f3789..1fdf2b0 100644
+--- a/src/core/verify.cpp
++++ b/src/core/verify.cpp
+@@ -2163,6 +2163,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
+             }
+         }
+     }
++    if (glm_ != nullptr) glm5_ldump_window(T, pos0);
+     VDBG("window done\n");
+     ++windows;
+     progress_at("decode");
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index 4d7966e..703ccd9 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -67,7 +67,42 @@ static const bool absorb_batch = [] { const char* v = std::getenv("STRATA_GLM5_A
+ // each for a one-token window (2026-10-10; bitwise the separate launches).  STRATA_GLM5_PROJ_BATCH=0: separate
+ static const bool proj_batch = [] { const char* v = std::getenv("STRATA_GLM5_PROJ_BATCH"); return !(v && v[0] == '0'); }();
+ 
++// step2c (investigation only): STRATA_GLM5_LDUMP=file + STRATA_GLM5_LDUMP_POS=p1,p2,...  appends, for each listed absolute
++// position and each layer, the hand-off state after that layer (R | block output | post | comb, F32) - from the windows
++// and from the chunk path alike - as records {int64 pos, int64 layer, HF floats}
++namespace {
++struct LDump {
++    std::string path;
++    std::vector<int64_t> pos;
++    std::FILE* f = nullptr;
++    bool on() const { return !path.empty() && !pos.empty(); }
++    bool has(int64_t p) const { return std::find(pos.begin(), pos.end(), p) != pos.end(); }
++    void write(int64_t p, int64_t l, const float* h, size_t n) {
++        if (f == nullptr) f = std::fopen(path.c_str(), "ab");
++        if (f == nullptr) return;
++        std::fwrite(&p, 8, 1, f); std::fwrite(&l, 8, 1, f); std::fwrite(h, 4, n, f); std::fflush(f);
++    }
++};
++LDump& ldump() {
++    static LDump d = [] {
++        LDump x;
++        if (const char* v = std::getenv("STRATA_GLM5_LDUMP")) x.path = v;
++        if (const char* v = std::getenv("STRATA_GLM5_LDUMP_POS")) {
++            std::string t = v; size_t i = 0;
++            while (i < t.size()) { size_t j = t.find(',', i); if (j == std::string::npos) j = t.size(); x.pos.push_back(std::atoll(t.substr(i, j - i).c_str())); i = j + 1; }
++        }
++        return x;
++    }();
++    return d;
++}
++}  // namespace
++
+ struct Verifier::Glm5 {
++    float* ldump_dev = nullptr;      // step2c: [n_layers][MT][HF] after each layer of the last window (STRATA_GLM5_LDUMP)
++    float* ldump2_dev = nullptr;     // step2c: [MT][2N+2K] the FFN input, routed ids / weights, shared output of layer STRATA_GLM5_LDUMP_LAYER
++    int64_t ldump2_layer = -1;
++    float* ldump3_dev = nullptr;     // step2c: [MT][K][N] the routed experts' output rows of that layer (before the combine)
++    int32_t* ldump3_ids = nullptr;   // [MT][K]
+     // geometry (from the GGUF)
+     int64_t N = 0, H = 0, S = 0, C = 0, DI = 0;            // n_embd, KDA heads, head dim, conv channels, H*S
+     int64_t NH = 0, QLR = 0, KVR = 0, QK = 0, VD = 0;      // MLA heads, q_lora_rank, kv_lora_rank (latent), q/v head dims
+@@ -216,6 +251,10 @@ bool Verifier::init_glm5(std::string& err) {
+     m.postA = m.dev<float>(T * 4); m.combA = m.dev<float>(T * 16); m.postF = m.dev<float>(T * 4); m.combF = m.dev<float>(T * 16);
+     m.dg = m.dev<float>(T * m.NFFD); m.du = m.dev<float>(T * m.NFFD); m.hmean = m.dev<float>(T * m.N);
+     m.q8 = m.dev<uint8_t>((size_t) (m.NH * T) * (m.KVR / 32) * 36 + (size_t) T * (m.NFFD / 32) * 36);
++    if (ldump().on()) {
++        m.ldump_dev = m.dev<float>((size_t) g.n_layers * T * handoff_floats(g));
++        if (const char* v = std::getenv("STRATA_GLM5_LDUMP_LAYER")) { m.ldump2_layer = std::atoll(v); m.ldump2_dev = m.dev<float>(T * (2 * m.N + 2 * m.K)); m.ldump3_dev = m.dev<float>(T * m.K * m.N); m.ldump3_ids = m.dev<int32_t>(T * m.K); }
++    }
+     for (void* p : m.allocs) if (p == nullptr) { err = "verify glm5: a device buffer does not fit"; return false; }
+     // the small tensors are read as F32 straight from the arena: refuse a pack that stored them narrower
+     {   // one of each kind in this verifier's layers (a layer split: a stage holds only its own)
+@@ -457,6 +496,14 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
+         nsw.up_data = wsu->native_data; nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data; nsw.q8_1 = m.q8;
+         shared_expert_multi(n, xm, nullptr, nsw, nullptr, sh_gate_, sh_up_, sh_g_, shared_, N, m.NFF, cs, nullptr, 0, m.clamp_sh);
+         quantize_q8_1_rows(xm, n, N, nat_xq_, cs);
++        if (m.ldump2_dev != nullptr && l == m.ldump2_layer)
++            for (int t = 0; t < n; ++t) {
++                float* d = m.ldump2_dev + (size_t) t * (2 * N + 2 * K);
++                cudaMemcpyAsync(d, xm + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs);
++                cudaMemcpyAsync(d + N, ids_ + (size_t) t * K, (size_t) K * 4, cudaMemcpyDeviceToDevice, cs);
++                cudaMemcpyAsync(d + N + K, w_ + (size_t) t * K, (size_t) K * 4, cudaMemcpyDeviceToDevice, cs);
++                cudaMemcpyAsync(d + N + 2 * K, shared_ + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs);
++            }
+         return true;
+     };
+ 
+@@ -495,6 +542,10 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
+         if (car_renorm) copy_i32_from_mapped((int32_t*) w_, (const int32_t*) m_w_, (int64_t) n * K, cs);
+         copy_rows_from_mapped(parts_, m_ymiss_, (int64_t) n * K, N, p_dst, p_counts + 1, cs);
+         moe_hit_add(parts_, hit_out_, p_dst, p_counts + 1, cap, N, cs);
++        if (m.ldump3_dev != nullptr && l == m.ldump2_layer) {
++            cudaMemcpyAsync(m.ldump3_dev, parts_, (size_t) n * K * N * 4, cudaMemcpyDeviceToDevice, cs);
++            cudaMemcpyAsync(m.ldump3_ids, ids_, (size_t) n * K * 4, cudaMemcpyDeviceToDevice, cs);
++        }
+         native_moe_combine_multi(parts_, w_, shared_, bo_, N, K, n, cs);
+         return true;
+     };
+@@ -503,6 +554,14 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
+         for (int64_t l = lb_; l < le_; ++l) {
+             if (!pre(l)) return false;
+             if (!post(l)) return false;
++            if (m.ldump_dev != nullptr)
++                for (int t = 0; t < T; ++t) {
++                    float* d = m.ldump_dev + ((size_t) l * MT + t) * HF;
++                    cudaMemcpyAsync(d, Rt(t), (size_t) HC * N * 4, cudaMemcpyDeviceToDevice, cs);
++                    cudaMemcpyAsync(d + HC * N, bo_ + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToDevice, cs);
++                    cudaMemcpyAsync(d + HC * N + N, m.postF + (size_t) t * HC, (size_t) HC * 4, cudaMemcpyDeviceToDevice, cs);
++                    cudaMemcpyAsync(d + HC * N + N + HC, m.combF + (size_t) t * HC * HC, (size_t) HC * HC * 4, cudaMemcpyDeviceToDevice, cs);
++                }
+         }
+         if (le_ < g.n_layers) {   // an earlier stage: R, the last FFN's output and its post / comb go on, no head
+             if (hand_out_ == nullptr) { err = "verify glm5: a stage without its hand-off"; return false; }
+@@ -533,6 +592,36 @@ bool Verifier::record_window_glm5(int T, cudaStream_t cs, std::string& err) {
+     return true;
+ }
+ 
++// step2c: after a window has run, write the listed positions' per-layer states
++void Verifier::glm5_ldump_window(int T, int64_t pos0) {
++    if (glm_ == nullptr || glm_->ldump_dev == nullptr) return;
++    LDump& d = ldump();
++    const int64_t HF = handoff_floats(*g_);
++    std::vector<float> h((size_t) HF);
++    bool synced = false;
++    for (int t = 0; t < T; ++t) {
++        if (!d.has(pos0 + t)) continue;
++        if (!synced) { cudaStreamSynchronize(cs_); synced = true; }
++        for (int64_t l = lb_; l < le_; ++l) {
++            cudaMemcpy(h.data(), glm_->ldump_dev + ((size_t) l * max_t_ + t) * HF, (size_t) HF * 4, cudaMemcpyDeviceToHost);
++            d.write(pos0 + t, l, h.data(), h.size());
++        }
++        if (glm_->ldump2_dev != nullptr) {
++            const size_t n2 = (size_t) (2 * glm_->N + 2 * glm_->K);
++            std::vector<float> h2(n2);
++            cudaMemcpy(h2.data(), glm_->ldump2_dev + (size_t) t * n2, n2 * 4, cudaMemcpyDeviceToHost);
++            d.write(pos0 + t, 1000 + glm_->ldump2_layer, h2.data(), n2);
++            const size_t K = (size_t) glm_->K, N = (size_t) glm_->N;
++            std::vector<float> h3(2 * K + K * N);
++            std::vector<int32_t> ids(K);
++            cudaMemcpy(ids.data(), glm_->ldump3_ids + (size_t) t * K, K * 4, cudaMemcpyDeviceToHost);
++            for (size_t k = 0; k < K; ++k) { h3[k] = (float) ids[k]; h3[K + k] = 0.f; }
++            cudaMemcpy(h3.data() + 2 * K, glm_->ldump3_dev + (size_t) t * K * N, K * N * 4, cudaMemcpyDeviceToHost);
++            d.write(pos0 + t, 2000 + glm_->ldump2_layer, h3.data(), h3.size());
++        }
++    }
++}
++
+ bool Verifier::capture_commit_glm5(std::string& err) {
+     using namespace strata::kernels;
+     const ModelGeometry& g = *g_;
+@@ -1038,11 +1127,18 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+     }
+     if (pf_blas_on) {
+         if (pf_blas == nullptr && cublasCreate(&pf_blas) != CUBLAS_STATUS_SUCCESS) pf_blas = nullptr;
++        // step2c (investigation only, off by default): STRATA_GLM5_PF_BLAS_STREAM=1 binds the handle to cs at once (below it
++        // is bound only when the scratch carve succeeds; otherwise the handle stays on the legacy default stream)
++        if (pf_blas != nullptr && std::getenv("STRATA_GLM5_PF_BLAS_STREAM") != nullptr) cublasSetStream(pf_blas, cs);
+         if (pf_blas != nullptr) {
+             float* p = parts;
+             float* const end = parts_end;
+             auto take = [&](size_t n) -> float* { float* r = p; p += (n + 63) & ~(size_t) 63; return p <= end ? r : nullptr; };
+             float* ws = take(kBlasWs / 4);
++            // step2c (investigation only, off by default): STRATA_GLM5_PF_WS_SEP=1 gives cuBLAS a workspace of its own
++            // instead of the front of `parts` (which the routed experts' outputs overwrite every layer)
++            static const bool ws_sep = std::getenv("STRATA_GLM5_PF_WS_SEP") != nullptr;
++            if (ws_sep) { ws = (float*) dalloc(kBlasWs); if (ws != nullptr) cudaMemset(ws, 0, kBlasWs); }
+             kb_f = take((size_t) m.NH * m.KVR * m.QK);
+             vb_f = take((size_t) m.NH * m.VD * m.KVR);
+             if (ws == nullptr || kb_f == nullptr || vb_f == nullptr) {
+@@ -1452,8 +1548,43 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         const float one = 1.0f, zero = 0.0f;
+         if (pf_router_blas && pf_blas != nullptr && T >= 16 &&
+             cublasSgemm(pf_blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) NE, (int) T, (int) N, &one, (const float*) wr->data, (int) N,
+-                        xmc, (int) N, &zero, logc, (int) NE) == CUBLAS_STATUS_SUCCESS)
++                        xmc, (int) N, &zero, logc, (int) NE) == CUBLAS_STATUS_SUCCESS) {
++            // step2c (investigation): STRATA_GLM5_PF_ROUTER_CHECK=1 compares the cuBLAS logits with glm5_f32_gemv's
++            static const bool chk = std::getenv("STRATA_GLM5_PF_ROUTER_CHECK") != nullptr;
++            if (chk) {
++                static float* dbg = nullptr;
++                static int calls = 0;
++                if (dbg == nullptr) cudaMalloc((void**) &dbg, (size_t) C * NE * 4);
++                glm5_f32_gemv((const float*) wr->data, xmc, dbg, (int) N, (int) NE, (int) T, 1.0f, cs);
++                cudaDeviceSynchronize();
++                cudaStream_t hs = nullptr; cublasGetStream(pf_blas, &hs);
++                if (calls < 3) std::fprintf(stderr, "strata glm5 router check: cublas handle stream %p, cs %p\n", (void*) hs, (void*) cs);
++                std::vector<float> a((size_t) T * NE), b((size_t) T * NE), xs((size_t) T * N);
++                cudaMemcpy(a.data(), logc, a.size() * 4, cudaMemcpyDeviceToHost);
++                cudaMemcpy(b.data(), dbg, b.size() * 4, cudaMemcpyDeviceToHost);
++                cudaMemcpy(xs.data(), xmc, xs.size() * 4, cudaMemcpyDeviceToHost);
++                double dmax = 0, bmax = 0, se = 0, sb = 0; int64_t top_diff = 0;
++                for (int64_t t = 0; t < T; ++t) {
++                    for (int64_t e = 0; e < NE; ++e) {
++                        const double d = std::fabs((double) a[(size_t) t * NE + e] - b[(size_t) t * NE + e]);
++                        dmax = std::max(dmax, d); bmax = std::max(bmax, (double) std::fabs(b[(size_t) t * NE + e]));
++                        se += d * d; sb += (double) b[(size_t) t * NE + e] * b[(size_t) t * NE + e];
++                    }
++                    int ia = 0, ib = 0;
++                    for (int64_t e = 1; e < NE; ++e) {
++                        if (a[(size_t) t * NE + e] > a[(size_t) t * NE + ia]) ia = (int) e;
++                        if (b[(size_t) t * NE + e] > b[(size_t) t * NE + ib]) ib = (int) e;
++                    }
++                    top_diff += ia != ib;
++                }
++                double xmax = 0; for (float v : xs) xmax = std::max(xmax, (double) std::fabs(v));
++                if (calls++ < 12 || calls % 10 == 0)
++                    std::fprintf(stderr, "strata glm5 router check #%d T %lld: max|cublas-gemv| %.4g (max|gemv| %.4g, rel rms %.3g), "
++                                         "argmax differs in %lld rows, max|x| %.4g\n", calls, (long long) T, dmax, bmax,
++                                 sb > 0 ? std::sqrt(se / sb) : 0.0, (long long) top_diff, xmax);
++            }
+             return;
++        }
+         glm5_f32_gemv((const float*) wr->data, xmc, logc, (int) N, (int) NE, (int) T, 1.0f, cs);
+     };
+     // STRATA_GLM5_PF_AHEAD: layer l's RAM-tier, non-resident experts (expert order, up to ahead_n) onto ahead_s, after
+@@ -1478,6 +1609,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         cudaEventRecord(ev_ahead_done, ahead_s);
+         ahead_layer = l;
+     };
++    int64_t cur_c0 = 0;   // step2c: the first token (within this call) of the chunk being run
+     auto moe = [&](int64_t l, int64_t T) -> bool {
+         touch_next(l + 1, T);
+         const WeightRef *wr = wfind(wt, l, "ffn_gate_inp.weight", err), *wb = wfind(wt, l, "exp_probs_b.bias", err),
+@@ -1794,7 +1926,34 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+                 glm5_copy_rows(src, idx, parts, pr, (int) N, cs);
+             }
+         }
++        if (LDump& ld = ldump(); ld.on() && std::getenv("STRATA_GLM5_LDUMP_LAYER") && l == std::atoll(std::getenv("STRATA_GLM5_LDUMP_LAYER"))) {
++            cudaStreamSynchronize(cs);
++            std::vector<float> h3((size_t) (2 * K + K * N));
++            std::vector<int32_t> ids((size_t) K);
++            for (int64_t t = 0; t < T; ++t) {
++                if (!ld.has(pos0 + cur_c0 + t)) continue;
++                cudaMemcpy(ids.data(), idsc + (size_t) t * K, (size_t) K * 4, cudaMemcpyDeviceToHost);
++                for (int64_t k = 0; k < K; ++k) {
++                    h3[(size_t) k] = (float) ids[(size_t) k];
++                    h3[(size_t) (K + k)] = (f.host_res && f.host_res[(size_t) l * NE + ids[(size_t) k]] >= 0) ? 1.f : 0.f;
++                }
++                cudaMemcpy(h3.data() + 2 * K, parts + (size_t) t * K * N, (size_t) K * N * 4, cudaMemcpyDeviceToHost);
++                ld.write(pos0 + cur_c0 + t, 2000 + l, h3.data(), h3.size());
++            }
++        }
+         native_moe_combine_multi(parts, wc, shc, boc, N, K, (int) T, cs);
++        if (LDump& ld = ldump(); ld.on() && std::getenv("STRATA_GLM5_LDUMP_LAYER") && l == std::atoll(std::getenv("STRATA_GLM5_LDUMP_LAYER"))) {
++            cudaStreamSynchronize(cs);
++            std::vector<float> h2((size_t) (2 * N + 2 * K));
++            for (int64_t t = 0; t < T; ++t) {
++                if (!ld.has(pos0 + cur_c0 + t)) continue;
++                cudaMemcpy(h2.data(), xmc + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToHost);
++                cudaMemcpy(h2.data() + N, idsc + (size_t) t * K, (size_t) K * 4, cudaMemcpyDeviceToHost);
++                cudaMemcpy(h2.data() + N + K, wc + (size_t) t * K, (size_t) K * 4, cudaMemcpyDeviceToHost);
++                cudaMemcpy(h2.data() + N + 2 * K, shc + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToHost);
++                ld.write(pos0 + cur_c0 + t, 1000 + l, h2.data(), h2.size());
++            }
++        }
+         kbvb_layer = -1;   // parts (where kb_f / vb_f are carved) now holds this layer's expert outputs
+         static const bool moe_prof = std::getenv("STRATA_GLM5_PF_PROF") != nullptr;
+         if (moe_prof) { cudaStreamSynchronize(cs); mlap2(3); }
+@@ -2568,6 +2727,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         } else {
+             for (int64_t c0 = 0; c0 < n_all; c0 += C) {
+                 const int64_t T = std::min<int64_t>(C, n_all - c0);
++                cur_c0 = c0;
+                 auto tp = std::chrono::steady_clock::now();
+                 if (!chunk_begin(c0, T, lb == 0)) return false;
+                 if (lb > 0) hand_parts(hand_in, nullptr, T);
+@@ -2577,6 +2737,19 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+                     if (!attn_side(l, T, tp)) return false;
+                     if (l < g.n_dense_layers ? !dense_ffn(l, T) : !moe(l, T)) return false;
+                     lap(ms_ffn, tp);
++                    if (LDump& ld = ldump(); ld.on()) {   // step2c
++                        bool synced = false;
++                        std::vector<float> h((size_t) HF);
++                        for (int64_t t = 0; t < T; ++t) {
++                            if (!ld.has(pos0 + c0 + t)) continue;
++                            if (!synced) { cudaStreamSynchronize(cs); synced = true; }
++                            cudaMemcpy(h.data(), Rc + (size_t) t * HC * N, (size_t) HC * N * 4, cudaMemcpyDeviceToHost);
++                            cudaMemcpy(h.data() + HC * N, boc + (size_t) t * N, (size_t) N * 4, cudaMemcpyDeviceToHost);
++                            cudaMemcpy(h.data() + HC * N + N, postF + (size_t) t * HC, (size_t) HC * 4, cudaMemcpyDeviceToHost);
++                            cudaMemcpy(h.data() + HC * N + N + HC, combF + (size_t) t * HC * HC, (size_t) HC * HC * 4, cudaMemcpyDeviceToHost);
++                            ld.write(pos0 + c0 + t, l, h.data(), h.size());
++                        }
++                    }
+                 }
+                 if (le < g.n_layers) hand_parts(nullptr, hand_out, T);   // synced below, before the caller sends it
+             }
+@@ -2596,6 +2769,11 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         if (FILE* fp = std::fopen(dp, "ab")) { std::fwrite(h.data(), 4, h.size(), fp); std::fclose(fp); }
+     }
+     prefill_ms_total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
++    if (std::getenv("STRATA_GLM5_PF_EXIT") != nullptr) {   // step2c (investigation only): end the process after the first prompt path, for compute-sanitizer
++        cudaDeviceSynchronize();
++        std::fprintf(stderr, "strata glm5 prefill: STRATA_GLM5_PF_EXIT - exiting after the prompt path\n");
++        std::exit(0);
++    }
+     if (prof) {
+         size_t fr = 0, tot = 0;
+         cudaMemGetInfo(&fr, &tot);
+-- 
+2.34.1
+

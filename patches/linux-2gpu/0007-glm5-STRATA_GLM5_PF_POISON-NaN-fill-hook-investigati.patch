@@ -1,0 +1,51 @@
+From 407887af953de180e91f5f415dedf0222040d649 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:56:36 +0900
+Subject: [PATCH 07/10] glm5: STRATA_GLM5_PF_POISON NaN-fill hook
+ (investigation, off by default)
+
+Original summary: step2c: STRATA_GLM5_PF_POISON (NaN-fill the MMQ images; investigation only)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/core/verify_glm5.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index 703ccd9..d36c8dc 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -1451,6 +1451,8 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+     auto run_mmq = [&](int64_t l, const uint8_t* wbase, int nb, int entries, int max_rows, const int32_t* d_bounds,
+                        const int32_t* d_tok, const float* x, int64_t ld, const int32_t* d_dst, float* out) {
+         mmq::iota(mm_iota, entries, cs);   // (gscratch is the native kernels' too: written each time)
++        if (const char* pz = std::getenv("STRATA_GLM5_PF_POISON"); pz != nullptr && pz[0] == '2')   // step2c (investigation only): NaN-fill the MMQ images first
++            cudaMemsetAsync(mm_gu, 0xFF, (size_t) ((uint8_t*) mm_iota - (uint8_t*) mm_gu), cs);
+         const auto& fm = lay.fmt[(size_t) l];
+         const NativeExpertLayout L = native_expert_layout(fm.gu_type, fm.d_type, fm.n_embd, fm.n_ff);
+         mmq::quantize(x, d_tok, mm_xq, fm.gu_type, N, ld, entries, cs);
+@@ -1458,7 +1460,21 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         gu.w = wbase; gu.type = fm.gu_type; gu.w_rows = 2 * NFF; gu.w_cols = N; gu.expert_bytes = max_blob; gu.n = nb;
+         gu.xq = mm_xq; gu.bounds = d_bounds; gu.ids = mm_iota; gu.total_rows = entries; gu.max_rows = max_rows;
+         gu.dst = mm_gu; gu.ld_dst = 2 * NFF;
++        static const bool poison = std::getenv("STRATA_GLM5_PF_POISON") != nullptr;   // step2c (investigation only)
++        if (poison) cudaMemsetAsync(mm_gu, 0xFF, (size_t) entries * 2 * NFF * 4, cs);
+         mq->run(gu, cs);
++        if (poison) {
++            cudaStreamSynchronize(cs);
++            std::vector<float> h((size_t) entries * 2 * NFF);
++            cudaMemcpy(h.data(), mm_gu, h.size() * 4, cudaMemcpyDeviceToHost);
++            int64_t bad = 0, first = -1;
++            for (size_t i = 0; i < h.size(); ++i) if (std::isnan(h[i])) { if (first < 0) first = (int64_t) i; ++bad; }
++            static int calls = 0;
++            if (bad > 0 || ++calls % 50 == 0)
++                std::fprintf(stderr, "strata glm5 poison check: layer %lld entries %d nb %d: %lld of %zu gate|up values never written%s (first at row %lld col %lld)\n",
++                             (long long) l, entries, nb, (long long) bad, h.size(), bad ? "!" : "", first < 0 ? -1LL : (long long) (first / (2 * NFF)),
++                             first < 0 ? -1LL : (long long) (first % (2 * NFF)));
++        }
+         glm5_swiglu_rows(mm_gu, entries, (int) NFF, m.clamp_exp, cs);
+         mmq::quantize(mm_gu, nullptr, mm_hq, fm.d_type, NFF, 2 * NFF, entries, cs);
+         mmq::Product dn;
+-- 
+2.34.1
+

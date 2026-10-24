@@ -1,0 +1,33 @@
+{
+ "_comment": "GLM-5.3-Flash on Linux with TWO GPUs (branch linux-2gpu). Replace <REPO>, <DATA>, <GGUF_DIR>. Layers [0,K) run on CUDA0, [K,45) + head on CUDA1 (--layer-split K --split-device 1; CUDA_DEVICE_ORDER=PCI_BUS_ID is set by the shell that starts the server). --resident-budget-gib: RAM for experts (128 GB box: 95). --pool-workers: 10 on a 6-core/12-thread CPU (do NOT use all threads). --vram-reserve-mib 3400 leaves room for the chunked prefill scratch. STRATA_GLM5_PF_MIN=256: continuations shorter than 256 new tokens use the sequential path. No expert skipping.",
+ "exe": "<REPO>/build-sm89/strata",
+ "args": [
+  "--pack", "<DATA>/packs/glm53_iq4xs",
+  "--native", "<GGUF_DIR>/GLM-5.3-Flash-UD-IQ4_XS-00001-of-00005.gguf",
+  "--prefill", "auto",
+  "--spec", "6",
+  "--max-context", "262144",
+  "--pcie-frac", "0",
+  "--mmap-experts",
+  "--resident-budget-gib", "95",
+  "--expert-profile", "<DATA>/packs/glm53_iq4xs/expert-profile-learned-2026-10-08b.bin",
+  "--expert-cache", "0",
+  "--adapt-every", "0",
+  "--pool-workers", "10",
+  "--vram-reserve-mib", "3400",
+  "--layer-split", "12",
+  "--split-device", "1",
+  "--trim-stage-weights"
+ ],
+ "gpu": "0,1",
+ "env": {"STRATA_GLM5_GO": "1", "STRATA_GLM5_PREFILL": "4096", "STRATA_GLM5_PF_DIRECT": "1",
+         "STRATA_POOL_GUIDED": "1", "STRATA_POOL_ETAIL": "6", "STRATA_GLM5_SLOTS": "8",
+         "STRATA_GLM5_PF_LAUNCH_ROWS": "2048", "STRATA_PREFILL_CPU_SHARE": "0",
+         "STRATA_IQ_MT_MIN": "1", "STRATA_GLM5_PF_MIN": "256"},
+ "cwd": "<REPO>",
+ "tokenizer": "<DATA>/packs/glm53_iq4xs/tokenizer",
+ "model_name": "glm-5.3-flash-strata",
+ "log": "<REPO>/build-sm89/strata-glm5-serve.log",
+ "host": "127.0.0.1",
+ "port": 8095
+}

@@ -1,0 +1,143 @@
+From 319416d5ef05ef7c552a18c43a214ce7b1b74df4 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:34:16 +0900
+Subject: [PATCH 09/10] glm5 serve: keep the prompt snapshot on a local two-GPU
+ layer split
+
+The snapshot (recurrent state of the last prompt, host RAM) was skipped whenever the
+head's chain was non-empty, which is also the case for --layer-split with --split-device
+in one process, so a conversation's next turn re-read the whole prompt.
+
+- Verifier::glm5_state_save/restore walk next_ like glm5_state_zero does: each stage's
+  span, in chain order, on its own device and stream (waited for); a stage in another
+  engine still refuses.
+- the serve loop saves the snapshot when the chain is local (gl_gs) as well.
+- a prompt stopped part-way (cancel in the window path) no longer leaves live/snapshot
+  claiming the whole prompt; a failed chunk prefill drops the snapshot too (cells from
+  'reused' on were partly overwritten).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ include/strata/core/verify.hpp |  3 +++
+ src/core/verify_glm5.cpp       | 34 ++++++++++++++++++++++++++--------
+ src/program/generate.cpp       | 10 ++++++++--
+ 3 files changed, 37 insertions(+), 10 deletions(-)
+
+diff --git a/include/strata/core/verify.hpp b/include/strata/core/verify.hpp
+index a43c6c0..bb447c1 100644
+--- a/include/strata/core/verify.hpp
++++ b/include/strata/core/verify.hpp
+@@ -299,6 +299,9 @@ public:
+     /// cells are never rewritten) - copied to `host`, back from it, or zeroed (a new sequence).
+     bool glm5_state_save(std::vector<float>& host, std::string& err);
+     bool glm5_state_restore(const std::vector<float>& host, std::string& err);
++    /// the chain's walk (a local layer split): this stage's span is appended to / read from `host` at `off`, then the next's
++    bool glm5_state_append(std::vector<float>& host, std::string& err);
++    bool glm5_state_restore_at(const std::vector<float>& host, size_t& off, std::string& err);
+     bool glm5_state_zero(std::string& err);
+     /// A sequence SLOT on disk (2026-10-09): the state above plus the latents and the indexer blocks of cells
+     /// [0, n_cells) - everything a later request whose prompt starts with `toks` needs to go on without reading them
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index 8ab7a22..9bf753d 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -701,35 +701,53 @@ static StateSpans glm5_spans(const ModelGeometry& g, SessionState& ss, float* ta
+ }
+ 
+ bool Verifier::glm5_state_save(std::vector<float>& host, std::string& err) {
++    host.clear();
++    return glm5_state_append(host, err);
++}
++
++// a layer split on one PC (2026-10-20): the state of every stage, in chain order - this verifier's span first, then
++// the next's (each on its own device and stream).  A stage in another engine cannot be read back.
++bool Verifier::glm5_state_append(std::vector<float>& host, std::string& err) {
++    if (remote_ != nullptr) { err = "glm5 state: a stage in another engine cannot be saved"; return false; }
+     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+     const OnDevice on_device(device_);
+     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
+-    host.resize(s.gdn_n + s.tail_n);
++    const size_t off = host.size();
++    host.resize(off + s.gdn_n + s.tail_n);
+     cudaStreamSynchronize(cs_);
+-    if (cudaMemcpy(host.data(), s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+-        cudaMemcpy(host.data() + s.gdn_n, s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
++    if (cudaMemcpy(host.data() + off, s.gdn, s.gdn_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
++        cudaMemcpy(host.data() + off + s.gdn_n, s.tail, s.tail_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+         err = "glm5 state: save failed";
+         return false;
+     }
+-    return true;
++    return next_ == nullptr || next_->glm5_state_append(host, err);
+ }
+ 
+ bool Verifier::glm5_state_restore(const std::vector<float>& host, std::string& err) {
++    size_t off = 0;
++    if (!glm5_state_restore_at(host, off, err)) return false;
++    if (off != host.size()) { err = "glm5 state: a snapshot of another size"; return false; }
++    return true;
++}
++
++bool Verifier::glm5_state_restore_at(const std::vector<float>& host, size_t& off, std::string& err) {
++    if (remote_ != nullptr) { err = "glm5 state: a stage in another engine cannot be restored"; return false; }
+     if (glm_ == nullptr) { err = "glm5 state: no glm5 window"; return false; }
+     const OnDevice on_device(device_);
+     const StateSpans s = glm5_spans(*g_, *ss_, glm_->tail, glm_->nD_own, glm_->ID);
+-    if (host.size() != s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
++    if (host.size() < off + s.gdn_n + s.tail_n) { err = "glm5 state: a snapshot of another size"; return false; }
+     // 2026-10-13: on cs_ and waited for.  A cudaMemcpy from pageable memory may return before its DMA lands, and cs_
+     // (non-blocking) does not wait for the legacy stream - the next prompt could read the previous conversation's
+     // state (Project Maya 4f1f4d7 saw a reply to another conversation's question)
+     cudaStreamSynchronize(cs_);
+-    if (cudaMemcpyAsync(s.gdn, host.data(), s.gdn_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+-        cudaMemcpyAsync(s.tail, host.data() + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
++    if (cudaMemcpyAsync(s.gdn, host.data() + off, s.gdn_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
++        cudaMemcpyAsync(s.tail, host.data() + off + s.gdn_n, s.tail_n * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+         cudaStreamSynchronize(cs_) != cudaSuccess) {
+         err = "glm5 state: restore failed";
+         return false;
+     }
+-    return true;
++    off += s.gdn_n + s.tail_n;
++    return next_ == nullptr || next_->glm5_state_restore_at(host, off, err);
+ }
+ 
+ bool Verifier::glm5_state_zero(std::string& err) {
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index e97ee84..39ed5c5 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -13447,6 +13447,7 @@ int main(int argc, char** argv) {
+                             if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
+                             err.clear();
+                             live.clear();   // the state holds part of this prompt now: the next request does not go on from it
++                            snap_toks.clear();   // and its cells may overlie the snapshot's
+                             continue;
+                         }
+                         if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+@@ -13460,6 +13461,7 @@ int main(int argc, char** argv) {
+                         if (err.find("do not fit") == std::string::npos && err.find("page-locked") == std::string::npos) return 1;
+                         err.clear();
+                         live.clear();   // as above
++                        snap_toks.clear();
+                         continue;
+                     }
+                 } else {
+@@ -13508,8 +13510,12 @@ int main(int argc, char** argv) {
+                 }
+                 const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - tp).count();
+                 live.assign(prompt.begin(), prompt.begin() + np);
+-                // multinode: no snapshot (a stage engine's state cannot be read back) - the live sequence only
+-                if (gl_chain.empty()) {
++                // multinode: no snapshot (a stage engine's state cannot be read back) - the live sequence only.  The local
++                // two-GPU split (gl_gs) has every stage in this process: its snapshot is the chain's states in order
++                if (cancelled) {   // the window path stopped part-way: the cells and the state are not the whole prompt's
++                    live.clear();
++                    snap_toks.clear();
++                } else if (gl_chain.empty() || gl_gs != nullptr) {
+                     if (!ver.glm5_state_save(snap, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+                     snap_toks = live;
+                     // slots: the whole prompt, when it is long enough to be worth a file and was not just read from one
+-- 
+2.34.1
+

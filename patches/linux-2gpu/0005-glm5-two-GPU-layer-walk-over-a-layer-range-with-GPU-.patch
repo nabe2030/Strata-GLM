@@ -1,0 +1,135 @@
+From 76f543aa492a7cd262263ba673f436d274e6c088 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 11:01:24 +0900
+Subject: [PATCH 05/10] glm5 two-GPU: layer walk over a layer range with GPU
+ hand-off rows
+
+Original summary: glm5 two-GPU: the layer walk runs a layer range (a group of up to chunk*hc tokens per call, hand-off rows between the GPUs): chunk prefill 225 s -> 78 s for 1300 tokens
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/core/verify_glm5.cpp | 30 ++++++++++++++++++++++++++----
+ src/program/generate.cpp | 27 +++++++++++++++++++++------
+ 2 files changed, 47 insertions(+), 10 deletions(-)
+
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index 17a031f..4d7966e 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -1955,7 +1955,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+ 
+     // a layer split: this call runs [lb, le) of one chunk; the hand-off rows are R | the last FFN's output | post | comb
+     const int64_t lb = l_begin, le = l_end < 0 ? g.n_layers : l_end, HF = handoff_floats(g);
+-    if (lb < 0 || le > g.n_layers || lb >= le || ((lb > 0 || le < g.n_layers) && n_all > C) ||
++    // (step2b: a range may take several chunks when the layer walk runs it - one group of up to C * HC tokens per call,
++    // the hand-off rows of all n_all tokens in the caller's buffers; checked again below once the walk's buffers are in)
++    static const bool pf_walk_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_WALK"); return !(v && v[0] == '0'); }();
++    if (lb < 0 || le > g.n_layers || lb >= le || ((lb > 0 || le < g.n_layers) && n_all > C && !pf_walk_on) ||
+         (lb > 0 && hand_in == nullptr) || (le < g.n_layers && hand_out == nullptr)) {
+         err = "verify glm5 prefill: a layer range runs one chunk, with its hand-offs";
+         return false;
+@@ -2148,7 +2151,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         void* p[5];
+         ~HostFree() { for (void* q : p) if (q) cudaFreeHost(q); }
+     } host_free{{nullptr, nullptr, nullptr, nullptr, nullptr}};
+-    bool walk = pf_walk && lb == 0 && le == g.n_layers && n_all > C;
++    bool walk = pf_walk && n_all > C;
+     if (walk) {
+         auto halloc = [&](size_t bytes, int i) -> void* {
+             void* p = nullptr;
+@@ -2173,6 +2176,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+             hfree();
+             if (PG <= 2 * C) break;
+         }
++        if (!walk && (lb > 0 || le < g.n_layers)) {
++            err = "verify glm5 prefill: a layer range runs one chunk, with its hand-offs (the layer walk has no page-locked memory)";
++            return false;
++        }
+         if (std::getenv("STRATA_GLM5_PF_PROF") != nullptr)
+             std::fprintf(stderr, "strata glm5 prefill: layer walk %s (groups of %lld tokens, %lld expert rows a launch, %zu MiB "
+                          "page-locked)\n", walk ? "on" : "off (no page-locked memory)", (long long) PG, (long long) E_cap,
+@@ -2505,9 +2512,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+                         const int64_t T = std::min<int64_t>(C, g0 + Pn - c0);
+                         float* hs = hostS + (size_t) (c0 - g0) * HF;
+                         auto tp = std::chrono::steady_clock::now();
+-                        if (!chunk_begin(c0, T, l == lb)) return false;
++                        if (!chunk_begin(c0, T, l == lb && lb == 0)) return false;
+                         (void) hs;
+                         if (l > lb) walk_parts(c0 - g0, T, true);
++                        else if (lb > 0) hand_parts(hand_in + (size_t) c0 * HF, nullptr, T);   // a later range: the previous range's state
+                         double f0 = ms_ffn;
+                         lap(ms_ffn, tp);
+                         w_ms[0] += ms_ffn - f0;   // the state in (and the steps, the embedding)
+@@ -2541,8 +2549,22 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+                         w_ms[3] += ms_ffn - f0;   // the routed experts
+                     }
+                 }
++                if (le < g.n_layers) {   // an earlier range: the group's final state, from the walk's arrays into the hand-off rows
++                    if (const cudaError_t se_w = cudaStreamSynchronize(cs); se_w != cudaSuccess) {
++                        err = std::string("verify glm5 prefill: ") + cudaGetErrorString(se_w);
++                        return false;
++                    }
++                    const float *hR = hostS, *hB = hR + (size_t) PG * HC * N, *hP = hB + (size_t) PG * N, *hC = hP + (size_t) PG * HC;
++                    for (int64_t t = 0; t < Pn; ++t) {
++                        float* row = hand_out + (size_t) (g0 + t) * HF;
++                        std::memcpy(row, hR + (size_t) t * HC * N, (size_t) HC * N * 4);
++                        std::memcpy(row + HC * N, hB + (size_t) t * N, (size_t) N * 4);
++                        std::memcpy(row + HC * N + N, hP + (size_t) t * HC, (size_t) HC * 4);
++                        std::memcpy(row + HC * N + N + HC, hC + (size_t) t * HC * HC, (size_t) HC * HC * 4);
++                    }
++                }
+             }
+-            walk_parts(last_c0 - last_g0, last_T, true);   // the caller reads the last chunk
++            if (le == g.n_layers) walk_parts(last_c0 - last_g0, last_T, true);   // the caller reads the last chunk
+         } else {
+             for (int64_t c0 = 0; c0 < n_all; c0 += C) {
+                 const int64_t T = std::min<int64_t>(C, n_all - c0);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 6c0ed88..e97ee84 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12673,7 +12673,28 @@ int main(int argc, char** argv) {
+             }
+             // multinode (2026-10-08): each chunk through [0, K1) here, the stage engines' ranges, then [Kn, end) here
+             std::vector<std::vector<float>> mn_hand;
++            float* gl_pf_hand = nullptr;   // one process, two GPUs: the hand-off rows of one walk group (page-locked, made once)
+             auto mn_prefill = [&](const int32_t* toks, int64_t n_tok, int64_t p0, std::string& e) -> bool {
++                if (gl_gs != nullptr) {
++                    // one call per group of up to pf_chunk * hc tokens: each range then runs the layer walk over the group
++                    // (its experts streamed once for the group, not once per chunk), the first range's last state going to
++                    // the later one through the hand-off rows
++                    const int64_t seg = (int64_t) pf_chunk * g.hc, HFl = strata::core::Verifier::handoff_floats(g);
++                    if (gl_pf_hand == nullptr &&
++                        cudaHostAlloc((void**) &gl_pf_hand, (size_t) seg * (size_t) HFl * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
++                        cudaGetLastError();
++                        e = "the prompt path's hand-off rows could not be page-locked";
++                        return false;
++                    }
++                    for (int64_t c0 = 0; c0 < n_tok; c0 += seg) {
++                        const int64_t T = std::min<int64_t>(seg, n_tok - c0);
++                        if (!ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, 0, split_at.front(), nullptr, gl_pf_hand) ||
++                            !gl_gs->ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf_gs, e, split_at.front(), -1, gl_pf_hand,
++                                                     nullptr))
++                            return false;
++                    }
++                    return true;
++                }
+                 const size_t nr = gl_links.size();
+                 const size_t rows = (size_t) pf_chunk * (size_t) strata::core::Verifier::handoff_floats(g);
+                 mn_hand.resize(nr + 1);
+@@ -12683,12 +12704,6 @@ int main(int argc, char** argv) {
+                     if (!ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf, e, 0, split_at.front(), nullptr,
+                                           mn_hand[0].data()))
+                         return false;
+-                    if (gl_gs != nullptr) {   // one process, two GPUs: the later GPU's range takes the chunk from the hand-off
+-                        if (!gl_gs->ver.prefill_glm5(toks + c0, T, p0 + c0, pf_chunk, pf_gs, e, split_at.front(), -1,
+-                                                     mn_hand[0].data(), nullptr))
+-                            return false;
+-                        continue;
+-                    }
+                     for (size_t r = 0; r < nr; ++r)
+                         if (!gl_links[r]->prefill((int) T, p0 + c0, toks + c0, mn_hand[r].data(), mn_hand[r + 1].data(), e))
+                             return false;
+-- 
+2.34.1
+

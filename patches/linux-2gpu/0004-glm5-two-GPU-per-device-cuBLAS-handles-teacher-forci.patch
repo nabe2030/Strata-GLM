@@ -1,0 +1,194 @@
+From 9245c34fb821694e22a782b09da51f8e503a2467 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 09:21:45 +0900
+Subject: [PATCH 04/10] glm5 two-GPU: per-device cuBLAS handles,
+ teacher-forcing serve hooks
+
+Original summary: glm5 two-GPU: per-device cuBLAS handle / shared-memory opt-ins (chunk prefill works on the later GPU), NaN guard reads the last stage, STRATA_SERVE_FOLLOW/LOGITS teacher-forcing hook
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ src/core/verify_glm5.cpp            |  9 ++++---
+ src/kernels/cuda/glm5_kda_chunk.cu  |  9 ++++---
+ src/kernels/cuda/qsa_decode_attn.cu | 16 +++++++++---
+ src/program/generate.cpp            | 38 ++++++++++++++++++++++++++---
+ 4 files changed, 59 insertions(+), 13 deletions(-)
+
+diff --git a/src/core/verify_glm5.cpp b/src/core/verify_glm5.cpp
+index 6f29194..17a031f 100644
+--- a/src/core/verify_glm5.cpp
++++ b/src/core/verify_glm5.cpp
+@@ -974,7 +974,10 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+     // GEMM a slice instead of 2 x n_head native_mmvq launches (half of the prompt path's ~1.8M launches a 4K chunk).
+     // The layer's two Q8_0 tensors are dequantized once per chunk into F32 scratch.  STRATA_GLM5_PF_BLAS=0: as before.
+     static const bool pf_blas_on = [] { const char* v = std::getenv("STRATA_GLM5_PF_BLAS"); return !(v && v[0] == '0'); }();
+-    static cublasHandle_t pf_blas = nullptr;
++    // one cuBLAS handle PER DEVICE (step2b): a handle made on CUDA0 is bound to CUDA0's context, and the later GPU of a
++    // two-GPU split runs this same function ("illegal memory access" at its first layer)
++    static cublasHandle_t pf_blas_dev[64] = {};
++    cublasHandle_t& pf_blas = pf_blas_dev[(device_ >= 0 && device_ < 64) ? device_ : 0];
+     float* kb_f = nullptr;   // [NH][KVR][QK]
+     float* vb_f = nullptr;   // [NH][VD][KVR]
+     int64_t kbvb_layer = -1;
+@@ -1496,7 +1499,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+         quantize_q8_1_rows(xmc, T, N, q8c, cs);
+         cudaMemcpyAsync(h_ids.data(), idsc, (size_t) TK * 4, cudaMemcpyDeviceToHost, cs);
+         const auto tm0 = std::chrono::steady_clock::now();
+-        if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
++        if (const cudaError_t se_r = cudaStreamSynchronize(cs); se_r != cudaSuccess) { err = std::string("verify glm5 prefill: the router failed on the GPU (CUDA") + std::to_string(device_) + ", layer " + std::to_string(l) + ": " + cudaGetErrorString(se_r) + ")"; return false; }
+         const bool ahead_here = ahead_layer == l;
+         if (ahead_here) cudaStreamWaitEvent(cs, ev_ahead_done, 0);   // the look-ahead slots have landed
+         auto ahead_of = [&](int32_t e) { return ahead_here ? ahead_slot[(size_t) e] : -1; };
+@@ -2203,7 +2206,7 @@ bool Verifier::prefill_glm5(const int32_t* tokens, int64_t n_all, int64_t pos0,
+     double w_plan_ms = 0, w_enq_ms = 0;   // STRATA_GLM5_PF_PROF: the walk's host-side parts
+     auto moe_walk = [&](int64_t l, int64_t Pn) -> bool {
+         touch_next(l + 1, Pn);
+-        if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "verify glm5 prefill: the router failed on the GPU"; return false; }
++        if (const cudaError_t se_r = cudaStreamSynchronize(cs); se_r != cudaSuccess) { err = std::string("verify glm5 prefill: the router failed on the GPU (CUDA") + std::to_string(device_) + ", layer " + std::to_string(l) + ": " + cudaGetErrorString(se_r) + ")"; return false; }
+         float* acc = Rc;
+         float* xa = parts;                                       // the group's FFN inputs
+         uint8_t* q8a = (uint8_t*) (parts + (size_t) PG * N);     // their q8_1 image (native layers)
+diff --git a/src/kernels/cuda/glm5_kda_chunk.cu b/src/kernels/cuda/glm5_kda_chunk.cu
+index 310e5d4..5e03735 100644
+--- a/src/kernels/cuda/glm5_kda_chunk.cu
++++ b/src/kernels/cuda/glm5_kda_chunk.cu
+@@ -591,10 +591,13 @@ __global__ __launch_bounds__(kThreads<DV>, (DV >= 32 ? 2 : 4)) void chunk_recurr
+ 
+ template <int DV> void launch_recurrence(const Args& args, const Chunk* workspace, cudaStream_t stream) {
+     constexpr int shared_bytes = (int) sizeof(RecurrenceShared<DV>);
+-    static bool attr = false;
+-    if (!attr) {
++    static bool attr[64] = {};   // the shared-memory opt-in is per device (a layer split runs this on several)
++    int adev = 0;
++    cudaGetDevice(&adev);
++    if (adev < 0 || adev >= 64) adev = 0;
++    if (!attr[adev]) {
+         cudaFuncSetAttribute(chunk_recurrence_kernel<DV>, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+-        attr = true;
++        attr[adev] = true;
+     }
+     chunk_recurrence_kernel<DV><<<args.value_heads * (kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, workspace);
+ }
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index 374ed64..0426e5a 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -920,14 +920,24 @@ void mla_decode_attn_any(const float* q_abs, const void* latent_pool, const int3
+     // the tensor-core chunk for the prompt path's sub-batches (>= 16 queries; the decode's windows, captured in graphs,
+     // keep the CUDA-core kernel).  STRATA_MLA_TC=0: the CUDA-core kernel everywhere
+     static const bool tc_on = [] { const char* v = std::getenv("STRATA_MLA_TC"); return !(v && v[0] == '0'); }();
+-    static bool tc_ready = false;
+-    if (tc_on && n_q >= 16 && !tc_ready) {
++    // per device (step2b): the shared-memory opt-in belongs to the device, and a layer split runs this on several
++    static bool tc_ready_dev[64] = {};
++    static bool tc_tried_dev[64] = {};
++    static int tc32_ready_dev[64];
++    static const bool tc32_init = [] { for (int& v : tc32_ready_dev) v = -1; return true; }();
++    (void) tc32_init;
++    int tdev = 0;
++    cudaGetDevice(&tdev);
++    if (tdev < 0 || tdev >= 64) tdev = 0;
++    bool& tc_ready = tc_ready_dev[tdev];
++    if (tc_on && n_q >= 16 && !tc_tried_dev[tdev]) {
++        tc_tried_dev[tdev] = true;
+         tc_ready = cudaFuncSetAttribute(mla_chunk_tc_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTcSmem) == cudaSuccess;
+         cudaGetLastError();
+     }
+     // the 32-head kernel where its shared memory fits (STRATA_MLA_TC32=0: the 16-head one)
+     static const bool tc32_on = [] { const char* v = std::getenv("STRATA_MLA_TC32"); return !(v && v[0] == '0'); }();
+-    static int tc32_ready = -1;
++    int& tc32_ready = tc32_ready_dev[tdev];
+     if (tc32_ready < 0 && tc_on && n_q >= 16) {
+         tc32_ready = tc32_on && n_head % MGH2 == 0 &&
+                      cudaFuncSetAttribute(mla_chunk_tc32_kernel<Q4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kMlaTc32Smem) == cudaSuccess;
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 2bb2cc9..6c0ed88 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -12649,6 +12649,22 @@ int main(int argc, char** argv) {
+             };
+             pf.stable = [](void* c, int64_t l, int64_t e) -> const uint8_t* { return ((strata::core::ExpertSource*) c)->blob_stable(l, e); };
+             pf.prefetch = [](void* c, int64_t l, const int64_t* e, int64_t n) { ((strata::core::ExpertSource*) c)->prefetch_async(l, e, n); };
++            // test hook: teacher-forced continuation and the logits file (see the decode loop)
++            std::vector<int32_t> serve_follow_ids;
++            std::FILE* serve_logits = nullptr;
++            if (const char* fv = std::getenv("STRATA_SERVE_FOLLOW")) {
++                std::ifstream fin(fv);
++                std::string txt((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
++                std::vector<int64_t> ids64;
++                std::string fe;
++                if (!fin || !parse_i64_list(txt.c_str(), ids64, fe)) {
++                    std::fprintf(stderr, "strata serve: cannot read STRATA_SERVE_FOLLOW %s\n", fv);
++                    return 2;
++                }
++                for (const int64_t v : ids64) serve_follow_ids.push_back((int32_t) v);
++                if (const char* lv = std::getenv("STRATA_SERVE_LOGITS")) serve_logits = std::fopen(lv, "wb");
++            }
++            const bool serve_follow = !serve_follow_ids.empty();
+             // the later GPU's own expert cache for the chunk path (one process, two GPUs)
+             strata::core::Verifier::Glm5Fetch pf_gs = pf;
+             if (gl_gs != nullptr) {
+@@ -13382,6 +13398,8 @@ int main(int argc, char** argv) {
+                 // the prompt's cells [reused, n - 1)
+                 bool cancelled = false;
+                 bool poisoned = false;   // 2026-10-13: a window's head logits were non-finite (Verifier::nonfinite_row)
++                // the head is on the last stage: with a split its verifier, not the first's, sees the logits (step2b)
++                auto nf_row = [&]() { return gl_chain.empty() ? ver.nonfinite_row : gl_last->nonfinite_row; };
+                 // STRATA_GLM5_PF_MIN (2026-10-10): the fewest new cells the chunk path takes (16); fewer go as verify windows
+                 static const int64_t pf_min = [] { const char* v = std::getenv("STRATA_GLM5_PF_MIN"); return v ? std::atoll(v) : 16; }();
+                 // STRATA_GLM5_PF_SEED_ROUNDS (2026-10-10, opt-in): after a prompt of >= 256 new cells, its routing counts go
+@@ -13441,10 +13459,10 @@ int main(int argc, char** argv) {
+                             std::fflush(stdout);
+                             return 1;
+                         }
+-                        if (ver.nonfinite_row >= 0 && !poisoned) {
++                        if (nf_row() >= 0 && !poisoned) {
+                             poisoned = true;
+                             std::fprintf(stderr, "strata serve: non-finite logits reading the prompt at position %lld "
+-                                                 "(row %d)\n", (long long) q, ver.nonfinite_row);
++                                                 "(row %d)\n", (long long) q, nf_row());
+                         }
+                         q += T;
+                         cancelled = stop_req.load();
+@@ -13507,6 +13525,7 @@ int main(int argc, char** argv) {
+                         const int k = sd.propose(o.spec - 1, sb.data());
+                         if (k > 0) { T = std::min<int>(k + 1, o.spec); for (int i = 1; i < T; ++i) win[(size_t) i] = sb[(size_t) i - 1]; }
+                     }
++                    if (serve_follow && produced_n < (int64_t) serve_follow_ids.size()) T = 1;   // teacher forcing: one position a window
+                     if (pos + T > o.max_context) { finish = "length"; break; }
+                     drive.d.layers = 0; drive.d.experts = 0; drive.d.failed = false;
+                     if (gjob) {
+@@ -13522,10 +13541,10 @@ int main(int argc, char** argv) {
+                         std::fflush(stdout);
+                         return 1;
+                     }
+-                    if (ver.nonfinite_row >= 0) {   // none of this window's tokens go out; the state is dropped below
++                    if (nf_row() >= 0) {   // none of this window's tokens go out; the state is dropped below
+                         std::fprintf(stderr, "strata serve: non-finite logits at position %lld (row %d): the reply ends "
+                                              "here and the next request reads its prompt from the start\n",
+-                                     (long long) pos, ver.nonfinite_row);
++                                     (long long) pos, nf_row());
+                         poisoned = true;
+                         finish = "nonfinite";
+                         break;
+@@ -13535,6 +13554,17 @@ int main(int argc, char** argv) {
+                         std::fflush(stdout);
+                         return 1;
+                     }
++                    // STRATA_SERVE_FOLLOW=ids.txt + STRATA_SERVE_LOGITS=out.bin (a test hook, 2026-10): the model's pick is replaced by
++                    // the given continuation and each position's logits (F32, one vocab row) are appended - two runs over the
++                    // same continuation compare position by position (KL, top-1), as --spec-follow does in the one-shot loop
++                    if (serve_follow && T == 1 && produced_n < (int64_t) serve_follow_ids.size()) {
++                        if (serve_logits != nullptr) {
++                            std::vector<float> row((size_t) ver.vocab());
++                            if (ver.copy_logits(0, row.data())) std::fwrite(row.data(), sizeof(float), row.size(), serve_logits);
++                            std::fflush(serve_logits);
++                        }
++                        outw[0] = serve_follow_ids[(size_t) produced_n];
++                    }
+                     int a = 0;
+                     while (a < T - 1 && win[(size_t) a + 1] == outw[(size_t) a]) ++a;
+                     if (!ver.commit(a + 1, err)) { std::printf("ERR %s\n", err.c_str()); std::fflush(stdout); return 1; }
+-- 
+2.34.1
+

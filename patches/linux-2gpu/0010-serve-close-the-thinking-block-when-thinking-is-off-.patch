@@ -1,0 +1,41 @@
+From 6533243a1878eeead386d0eef093bc4508bd90a9 Mon Sep 17 00:00:00 2001
+From: nabe2030 <nabe2030@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 00:34:16 +0900
+Subject: [PATCH 10/10] serve: close the thinking block when thinking is off
+ and the template cannot
+
+Original summary: serve: close the thinking block when a request turns thinking off and the template cannot
+
+A template with no enable_thinking switch (GLM's: the generation prompt always ends in
+<think>) left the model to think into the reply, so its reasoning came out as content.
+When enable_thinking is false and the rendered prompt ends in <think>, append </think>:
+the empty thinking block a history turn is drawn with, so a cached prefix still matches.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ serve/server.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/serve/server.py b/serve/server.py
+index 8e6283d..0571716 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -3159,6 +3159,15 @@ class Service:
+                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
+ 
+     def render_prompt(self, messages, tools, kwargs) -> str:
++        """The template rendered, and for a request without thinking closed the way the model expects: a template with
++        no switch for it (GLM's: the generation prompt always ends in `<think>`) leaves the model to think into the
++        reply, so the thinking block is closed - the empty one a history turn is drawn with."""
++        text = self._render_prompt(messages, tools, kwargs)
++        if kwargs.get("enable_thinking") is False and text.endswith("<think>"):
++            text += "</think>"
++        return text
++
++    def _render_prompt(self, messages, tools, kwargs) -> str:
+         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
+         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
+         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
+-- 
+2.34.1
+
